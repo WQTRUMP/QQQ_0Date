@@ -277,7 +277,7 @@ pub struct RawOptionQuote {
 
 // ── 市场状态 ──────────────────────────────────────────
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MarketEvent {
     Open,

@@ -11,7 +11,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
 use futures_util::StreamExt;
-use qqq_common::{json_bytes, subjects, AssetClass, Instrument, RealtimeState, TradeSide};
+use qqq_common::{json_bytes, subjects, AssetClass, Instrument, PremarketInit, RealtimeState, TradeSide};
 use redis::AsyncCommands;
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
@@ -49,19 +49,22 @@ struct KlineBar {
 
 struct IndicatorCache {
     bars: VecDeque<KlineBar>,
+    bars_seen: u64,
     vix: Option<f64>,
     qqq_price: Option<Decimal>,
 }
 
 impl IndicatorCache {
     fn new() -> Self {
-        Self { bars: VecDeque::with_capacity(MAX_KLINES), vix: None, qqq_price: None }
+        Self { bars: VecDeque::with_capacity(MAX_KLINES), bars_seen: 0, vix: None, qqq_price: None }
     }
     fn push_kline(&mut self, bar: KlineBar) {
+        self.bars_seen += 1;
         self.bars.push_back(bar);
         if self.bars.len() > MAX_KLINES { self.bars.pop_front(); }
     }
     fn kline_count(&self) -> u32 { self.bars.len() as u32 }
+    fn bars_seen(&self) -> u64 { self.bars_seen }
 
     fn donchian(&self, n: usize) -> Option<(f64, f64)> {
         if self.bars.len() < n { return None; }
@@ -146,9 +149,11 @@ impl IndicatorCache {
         let sum_y: f64 = closes.iter().sum();
         let sum_xy: f64 = closes.iter().enumerate().map(|(i, &y)| i as f64 * y).sum();
         let sum_x2: f64 = (0..n).map(|i| (i as f64).powi(2)).sum();
+        let mean_x = sum_x / n_f;
         let mean_y = sum_y / n_f;
         let slope = (n_f * sum_xy - sum_x * sum_y) / (n_f * sum_x2 - sum_x * sum_x);
-        let ss_res: f64 = closes.iter().enumerate().map(|(i, &y)| (y - (slope * i as f64 + mean_y)).powi(2)).sum();
+        let intercept = mean_y - slope * mean_x;
+        let ss_res: f64 = closes.iter().enumerate().map(|(i, &y)| (y - (slope * i as f64 + intercept)).powi(2)).sum();
         let ss_tot: f64 = closes.iter().map(|&y| (y - mean_y).powi(2)).sum();
         let r_squared = if ss_tot == 0.0 { 0.0 } else { 1.0 - ss_res / ss_tot };
         Some((slope, r_squared))
@@ -242,10 +247,10 @@ async fn main() -> Result<()> {
                 bar["close"].as_f64(), bar["volume"].as_i64(),
             ) else { continue };
 
-            let count = {
+            let (count, bars_seen) = {
                 let mut c = kline_cache.lock().unwrap();
                 c.push_kline(KlineBar { open, high, low, close, volume: vol as f64 });
-                c.kline_count()
+                (c.kline_count(), c.bars_seen())
             };
             // 持久化到 Redis（冷启动恢复用）
             if let Ok(payload_str) = String::from_utf8(msg.payload.to_vec()) {
@@ -256,7 +261,9 @@ async fn main() -> Result<()> {
             }
             if count == 1 { info!("⏳ K 线冷启动中——需要 20 根 1 分钟 K 线才能计算指标（约 20 分钟）"); }
             if count == 20 && !*kline_init_published.lock().unwrap() { *kline_init_published.lock().unwrap() = true; info!("✅ K 线缓存就绪，开始计算技术指标"); }
-            if count >= 20 && (count == 20 || count % 60 == 0) { publish_init(&kline_nats, &kline_cache).await; }
+            if count >= 20 && (bars_seen == 20 || (bars_seen > 20 && (bars_seen - 20) % 60 == 0)) {
+                publish_init_refresh(&kline_nats, &kline_cache).await;
+            }
             if count % 50 == 1 && count > 20 { info!(count = count, "K 线缓存"); }
         }
     });
@@ -359,23 +366,46 @@ async fn publish_state(
     let _ = nats.publish(subjects::state(&state.instrument), body.into()).await;
 }
 
-async fn publish_init(
+async fn publish_init_refresh(
     nats: &async_nats::Client,
     cache: &std::sync::Arc<std::sync::Mutex<IndicatorCache>>,
 ) {
-    let (atr_val, hv_val, slope, r2) = {
+    let snapshot = {
         let c = cache.lock().unwrap();
-        (c.atr(14), c.historical_volatility(20), c.trend(20).map(|(s,_)| s), c.trend(20).map(|(_,r)| r))
+        let recent: Vec<&KlineBar> = c.bars.iter().rev().take(20).collect();
+        if recent.len() < 20 {
+            return;
+        }
+        let high_20d = recent.iter().map(|bar| bar.high).fold(f64::MIN, f64::max);
+        let low_20d = recent.iter().map(|bar| bar.low).fold(f64::MAX, f64::min);
+        let avg_close = recent.iter().map(|bar| bar.close).sum::<f64>() / recent.len() as f64;
+        let (trend_slope, trend_score) = c.trend(20).unwrap_or((0.0, 0.5));
+        PremarketInit {
+            instrument: Instrument {
+                asset_class: AssetClass::Option,
+                symbol: "QQQ".to_string(),
+                venue: None,
+                base: Some("QQQ".to_string()),
+                quote: None,
+                expiry: None,
+                strike: None,
+                option_right: None,
+            },
+            historical_volatility: Decimal::from_f64_retain(c.historical_volatility(20).unwrap_or(0.25)).unwrap_or_default(),
+            atr: Decimal::from_f64_retain(c.atr(14).unwrap_or(0.4)).unwrap_or_default(),
+            high_20d: Decimal::from_f64_retain(high_20d).unwrap_or_default(),
+            low_20d: Decimal::from_f64_retain(low_20d).unwrap_or_default(),
+            avg_close_20d: Decimal::from_f64_retain(avg_close).unwrap_or_default(),
+            trend_slope: Decimal::from_f64_retain(trend_slope).unwrap_or_default(),
+            trend_score: Decimal::from_f64_retain(trend_score).unwrap_or(Decimal::from_f64_retain(0.5).unwrap()),
+            generated_at: Utc::now(),
+        }
     };
-    let init = serde_json::json!({
-        "atr": atr_val.unwrap_or(0.4),
-        "historical_volatility": hv_val.unwrap_or(0.25),
-        "trend_slope": slope.unwrap_or(0.0),
-        "trend_score": r2.unwrap_or(0.5),
-    });
-    if let Err(e) = nats.publish("init.option.qqq", serde_json::to_vec(&init).unwrap().into()).await {
-        error!(error = %e, "发布 init 失败");
+
+    let subject = subjects::premkt_init_refresh(&snapshot.instrument);
+    if let Err(e) = nats.publish(subject.clone(), json_bytes(&snapshot).unwrap().into()).await {
+        error!(error = %e, subject = %subject, "发布 init refresh 失败");
     } else {
-        info!(atr = %init["atr"], hv = %init["historical_volatility"], slope = %init["trend_slope"], r2 = %init["trend_score"], "📡 盘前初始化已发布");
+        info!(subject = %subject, atr = %snapshot.atr, hv = %snapshot.historical_volatility, slope = %snapshot.trend_slope, r2 = %snapshot.trend_score, "📡 盘中初始化刷新已发布");
     }
 }

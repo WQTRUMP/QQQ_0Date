@@ -75,8 +75,9 @@ VIX.US WebSocket tick
 |------|--------|------|
 | `state.option.qqq` | Realtime Engine | `RealtimeState` (last_price, ADX, Donchian, BB, vix_level, kline_count) |
 | `greeks.option.qqq` | Greeks Engine | `GreeksSnapshot` (gamma_flip, max_pain, 期权 Greeks 列表) |
-| `init.option.qqq` | Premarket Init | `PremarketInit` (HV, ATR, trend_slope, trend_score) |
-| `market.option.qqq.status` | Market Status | `MarketStatus` (Open/Close/Halted) |
+| `init.option.qqq` | Premarket Init | `PremarketInit` (HV, ATR, high_20d, low_20d, avg_close_20d, trend_slope, trend_score) |
+| `init.option.qqq.refresh` | Realtime Engine | `PremarketInit`（盘中同 schema 刷新，避免复用 `init.option.qqq` 裸 JSON） |
+| `market.option.qqq.status` | Market Status | `MarketStatus` (Open/Close/Halted, `session_id`) |
 
 ### 2.3 体制 & 信号层
 

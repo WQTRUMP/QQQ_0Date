@@ -555,7 +555,7 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
             s.positions.insert(sell_pos.order_id.clone(), sell_pos);
             s.positions.insert(buy_pos.order_id.clone(), buy_pos);
             s.position_count += 2;
-            info!(base = %base, net_credit = %net_credit, width = %width, max_loss = %max_loss, qty = %qty, "🔗 信用价差已配对 净权{:.2}×{}=${}", net_credit, qty, net_credit * Decimal::from(100) * qty);
+            info!(base = %base, net_credit = %net_credit, width = %width, max_loss = %max_loss, qty = %fill.quantity, "🔗 信用价差已配对 净权{:.2}×{}=${}", net_credit, fill.quantity, net_credit * Decimal::from(100) * fill.quantity);
         } else {
             s.pending_spreads.insert(base.clone(), pos);
             let leg_num = fill.leg.unwrap_or(0);
@@ -611,7 +611,7 @@ fn handle_status(state: &Arc<Mutex<RiskState>>, payload: &[u8]) {
         && status.session_id == s.active_session_id
         && matches!(
             (&status.event, s.market_open),
-            (MarketEvent::Open, true) | (MarketEvent::Close, false)
+            (&MarketEvent::Open, true) | (&MarketEvent::Close, false)
         );
     if duplicated_session {
         info!(session_id = ?status.session_id, event = ?status.event, "忽略重复市场状态事件");
