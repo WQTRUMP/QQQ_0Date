@@ -3,8 +3,9 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures_util::StreamExt;
 use qqq_common::{
-    json_bytes, subjects, AssetClass, Instrument, OrderIntent, OrderSide, OrderType,
-    RiskDecision, RiskReport, SignalAction, StrategySignal, Venue,
+    json_bytes, session_clock, subjects, AssetClass, FillEvent, Instrument, MarketEvent,
+    MarketStatus, OrderIntent, OrderSide, OrderType, RiskDecision, RiskReport, SignalAction,
+    StrategySignal, Venue,
 };
 use redis::AsyncCommands;
 use rust_decimal::prelude::ToPrimitive;
@@ -224,6 +225,9 @@ struct RiskState {
     vix_history: VecDeque<Decimal>,
     /// 购买力（USD），来自 Dashboard Bridge 每 15s 推送
     buying_power: Decimal,
+    /// 当前市场会话，用于忽略同一交易日的重复 OPEN/CLOSE
+    active_session_id: Option<String>,
+    market_open: bool,
 }
 
 impl RiskState {
@@ -239,6 +243,8 @@ impl RiskState {
             vix_previous: Decimal::ZERO,
             vix_history: VecDeque::new(),
             buying_power: Decimal::MAX,  // 初始默认无限制，等 dashboard 推送后更新
+            active_session_id: None,
+            market_open: false,
         }
     }
     fn reset(&mut self) {
@@ -269,15 +275,8 @@ fn dynamic_quantity(confidence: Decimal, min_conf: Decimal, min_qty: Decimal, ma
 
 // ── 时间工具 ──────────────────────────────────────────
 
-fn minutes_to_close(close_utc: &str) -> Option<i64> {
-    let parts: Vec<&str> = close_utc.split(':').collect();
-    if parts.len() != 2 { return None; }
-    let h: u32 = parts[0].parse().ok()?;
-    let m: u32 = parts[1].parse().ok()?;
-    let now = Utc::now();
-    let close = now.date_naive().and_hms_opt(h, m, 0)?;
-    let diff = (close - now.naive_utc()).num_minutes();
-    if diff < 0 { None } else { Some(diff) }
+fn minutes_to_close(_close_utc: &str) -> Option<i64> {
+    session_clock::minutes_to_close(Utc::now())
 }
 
 // ── 主入口 ────────────────────────────────────────────
@@ -302,6 +301,12 @@ async fn main() -> Result<()> {
         .context("Redis 多路复用连接失败")?;
 
     let state = Arc::new(Mutex::new(RiskState::new()));
+    {
+        let snapshot = session_clock::current_session(Utc::now());
+        let mut s = state.lock().unwrap();
+        s.active_session_id = Some(snapshot.session_id);
+        s.market_open = matches!(snapshot.state, MarketEvent::Open);
+    }
 
     // ── 从 Redis 恢复已处理信号（防重启重复下单）──
     let redis_signal_prefix: &str = "risk:signal:";
@@ -430,7 +435,7 @@ fn extract_strategy_id(source: &str) -> String {
 }
 
 fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
-    let fill: serde_json::Value = match serde_json::from_slice(payload) {
+    let fill: FillEvent = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "解析成交失败");
@@ -438,35 +443,25 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
         }
     };
 
-    let order_id = fill.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
-    if order_id.is_empty() {
+    if fill.order_id.is_empty() {
         warn!("成交缺少 order_id");
         return;
     }
 
     let mut s = state.lock().unwrap();
-    if s.counted_fills.contains(order_id) {
+    if s.counted_fills.contains(&fill.order_id) {
         return;
     }
 
     // 从 source_signal_id 提取策略 ID
-    let source_signal_id = fill.get("source_signal_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let strategy_id = extract_strategy_id(source_signal_id);
+    let strategy_id = extract_strategy_id(&fill.source_signal_id);
 
     // ── 检测退出订单 ──
-    let is_exit = fill.get("is_exit").and_then(|v| v.as_bool()).unwrap_or(false);
-    if is_exit {
-        s.counted_fills.insert(order_id.to_string());
-        let sym = fill.get("instrument")
-            .and_then(|i| i.get("symbol"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+    if fill.is_exit {
+        s.counted_fills.insert(fill.order_id.clone());
 
-        // 按 source_signal_id（原始信号 ID）匹配持仓
         let to_remove: Vec<String> = s.positions.iter()
-            .filter(|(_, pos)| pos.source_signal_id == source_signal_id)
+            .filter(|(_, pos)| pos.source_signal_id == fill.source_signal_id)
             .map(|(k, _)| k.clone())
             .collect();
         let removed = to_remove.len();
@@ -475,55 +470,52 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
             s.position_count = s.position_count.saturating_sub(1);
         }
         if removed > 0 {
-            info!(order_id = %order_id, symbol = %sym, count = removed, "📤 平仓已确认（按 source_signal_id 匹配）");
+            info!(order_id = %fill.order_id, symbol = %fill.instrument.symbol, count = removed, "📤 平仓已确认（按 source_signal_id 匹配）");
         } else {
-            warn!(order_id = %order_id, source_signal_id = %source_signal_id, "⚠️ 平仓成功但本地无此持仓");
+            warn!(order_id = %fill.order_id, source_signal_id = %fill.source_signal_id, "⚠️ 平仓成功但本地无此持仓");
         }
         return;
     }
 
-    let sym = fill.get("instrument")
-        .and_then(|i| i.get("symbol"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let side_str = fill.get("side").and_then(|v| v.as_str()).unwrap_or("BUY");
-    let side = if side_str == "SELL" { OrderSide::Sell } else { OrderSide::Buy };
-    let entry = fill.get("price")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Decimal::from_str_exact(s).ok())
-        .unwrap_or(Decimal::ZERO);
-    let qty = fill.get("quantity")
-        .and_then(|v| v.as_str())
-        .and_then(|s| Decimal::from_str_exact(s).ok())
-        .unwrap_or(Decimal::ONE);
-
-    if entry <= Decimal::ZERO || sym.is_empty() {
-        warn!(order_id = %order_id, "成交数据不完整");
+    if fill.price <= Decimal::ZERO || fill.instrument.symbol.is_empty() {
+        warn!(order_id = %fill.order_id, "成交数据不完整");
         return;
     }
 
-    s.counted_fills.insert(order_id.to_string());
-    // 检查是否属于价差组合（multi-leg）
-    let total_legs = fill.get("total_legs").and_then(|v| v.as_u64()).unwrap_or(1);
+    s.counted_fills.insert(fill.order_id.clone());
+    let total_legs = fill.total_legs.unwrap_or(1);
     if total_legs >= 2 {
-        // 从 order_id 提取 base（去掉 -L0/-L1 后缀）
-        let base = match order_id.rsplit_once("-L") {
+        let base = match fill.order_id.rsplit_once("-L") {
             Some((base, _)) if !base.is_empty() => base.to_string(),
             _ => {
-                warn!(order_id = %order_id, "⚠️ 价差订单缺少腿编号 -L0/-L1，按单腿处理");
-                // 降级为单腿
+                warn!(order_id = %fill.order_id, "⚠️ 价差订单缺少腿编号 -L0/-L1，按单腿处理");
                 s.position_count += 1;
-                let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
-                s.positions.insert(order_id.to_string(), pos);
-                info!(order_id = %order_id, symbol = %sym, strategy = %strategy_id, "📊 持仓已跟踪（降级单腿）");
+                let pos = TrackedPosition::new(
+                    fill.order_id.clone(),
+                    fill.instrument.symbol.clone(),
+                    fill.side.clone(),
+                    fill.price,
+                    fill.quantity,
+                    strategy_id.clone(),
+                    fill.source_signal_id.clone(),
+                );
+                s.positions.insert(fill.order_id.clone(), pos);
+                info!(order_id = %fill.order_id, symbol = %fill.instrument.symbol, strategy = %strategy_id, "📊 持仓已跟踪（降级单腿）");
                 return;
             }
         };
 
-        let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
+        let pos = TrackedPosition::new(
+            fill.order_id.clone(),
+            fill.instrument.symbol.clone(),
+            fill.side.clone(),
+            fill.price,
+            fill.quantity,
+            strategy_id.clone(),
+            fill.source_signal_id.clone(),
+        );
 
         if let Some(first_leg) = s.pending_spreads.remove(&base) {
-            // ── 第二条腿到达 → 配对 ──
             let (sell_leg, buy_leg) = if matches!(first_leg.side, OrderSide::Sell) {
                 (first_leg, pos)
             } else {
@@ -535,22 +527,20 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
             // 净权利金 = 卖腿收入 - 买腿支出
             let net_credit = sell_entry - buy_entry;
 
-            // 从 fill instrument 解析 strike 计算宽度
-            let sell_strike = fill_for_leg(&fill, &sell_leg)
-                .or_else(|| fill_strike_from_pending(&base, &s, &sell_leg.order_id));
-            let buy_strike = fill_for_leg(&fill, &buy_leg)
-                .or_else(|| fill_strike_from_pending(&base, &s, &buy_leg.order_id));
+            let sell_strike = leg_strike(&fill, &sell_leg);
+            let buy_strike = leg_strike(&fill, &buy_leg);
 
             let width: Decimal;
             if let (Some(ss), Some(bs)) = (sell_strike, buy_strike) {
                 width = if ss > bs { ss - bs } else { bs - ss };
             } else {
-                // 无法解析 strike，回退到配置的 wing_width
                 width = args.spread_wing_width;
                 warn!(base = %base, "⚠️ 无法解析价差strike，使用配置宽度 {:.1}pt", width);
             }
 
-            let max_loss = (width * Decimal::from(100) - net_credit * Decimal::from(100)).max(Decimal::ZERO) * qty;
+            let max_loss =
+                (width * Decimal::from(100) - net_credit * Decimal::from(100)).max(Decimal::ZERO)
+                    * fill.quantity;
 
             let mut sell_pos = sell_leg;
             let mut buy_pos = buy_leg;
@@ -567,70 +557,82 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
             s.position_count += 2;
             info!(base = %base, net_credit = %net_credit, width = %width, max_loss = %max_loss, qty = %qty, "🔗 信用价差已配对 净权{:.2}×{}=${}", net_credit, qty, net_credit * Decimal::from(100) * qty);
         } else {
-            // 第一条腿 → 暂存等待配对
             s.pending_spreads.insert(base.clone(), pos);
-            let leg_num = fill.get("leg").and_then(|v| v.as_u64()).unwrap_or(0);
+            let leg_num = fill.leg.unwrap_or(0);
             info!(base = %base, leg = leg_num, "⏳ 等待价差第二条腿");
         }
     } else {
-        // 单腿持仓
         s.position_count += 1;
-        let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
-        s.positions.insert(order_id.to_string(), pos);
-        info!(order_id = %order_id, symbol = %sym, side = %side_str, entry = %entry, qty = %qty, count = s.position_count, strategy = %strategy_id, "📊 持仓已跟踪");
+        let pos = TrackedPosition::new(
+            fill.order_id.clone(),
+            fill.instrument.symbol.clone(),
+            fill.side.clone(),
+            fill.price,
+            fill.quantity,
+            strategy_id.clone(),
+            fill.source_signal_id.clone(),
+        );
+        s.positions.insert(fill.order_id.clone(), pos);
+        info!(order_id = %fill.order_id, symbol = %fill.instrument.symbol, side = ?fill.side, entry = %fill.price, qty = %fill.quantity, count = s.position_count, strategy = %strategy_id, "📊 持仓已跟踪");
     }
 
 }
 
-/// 从某条腿的 fill 消息解析 strike
-fn fill_strike(fill: &serde_json::Value) -> Option<Decimal> {
-    fill.get("instrument")
-        .and_then(|i| i.get("strike"))
-        .and_then(|v| v.as_str())
-        .and_then(|s| Decimal::from_str_exact(s).ok())
-        .or_else(|| {
-            fill.get("instrument")
-                .and_then(|i| i.get("strike"))
-                .and_then(|v| v.as_f64())
-                .and_then(|f| Decimal::from_f64_retain(f))
-        })
+fn parse_strike_from_symbol(symbol: &str) -> Option<Decimal> {
+    let right_idx = symbol.find('C').or_else(|| symbol.find('P'))?;
+    let raw = symbol
+        .get((right_idx + 1)..)?
+        .strip_suffix(".US")
+        .unwrap_or_else(|| symbol.get((right_idx + 1)..).unwrap_or_default());
+    let strike_raw: i64 = raw.parse().ok()?;
+    Some(Decimal::from(strike_raw) / Decimal::from(1000))
 }
 
-/// 按腿的 order_id 匹配 fill：当前 fill 匹配某条腿时用它，否则尝试从 pending 中找
-fn fill_for_leg(fill: &serde_json::Value, leg: &TrackedPosition) -> Option<Decimal> {
-    let fill_oid = fill.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
-    if fill_oid == leg.order_id {
-        fill_strike(fill)
+fn leg_strike(fill: &FillEvent, leg: &TrackedPosition) -> Option<Decimal> {
+    if fill.order_id == leg.order_id {
+        fill.instrument
+            .strike
+            .or_else(|| parse_strike_from_symbol(&fill.instrument.symbol))
     } else {
-        None
+        parse_strike_from_symbol(&leg.symbol)
     }
-}
-
-/// 从 pending_spreads 中取某条腿的 strike（通过 symbol 反查，精度有限）
-fn fill_strike_from_pending(_base: &str, _s: &std::sync::MutexGuard<'_, RiskState>, _oid: &str) -> Option<Decimal> {
-    // pending_spreads 被 remove 后已不存在，只能通过 symbol 中解析 strike
-    // option symbol 格式: QQQ{YYMMDD}{C/P}{STRIKE*1000}.US
-    // 例如: QQQ260601C450000.US → strike = 450000 / 1000 = 450
-    // 但 leg 的 symbol 已在 TrackedPosition 中，这里尝试从 fill 获取
-    None // 回退到配置 SPREAD_WING_WIDTH
 }
 
 // ── 市场状态 ──────────────────────────────────────────
 
 fn handle_status(state: &Arc<Mutex<RiskState>>, payload: &[u8]) {
-    let status: serde_json::Value = match serde_json::from_slice(payload) {
+    let status: MarketStatus = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => { warn!(error = %e, "解析状态失败"); return; }
     };
-    let event = status.get("event").and_then(|v| v.as_str()).unwrap_or("");
-    match event {
-        "OPEN" => { state.lock().unwrap().reset(); info!("📈 开盘 — 状态重置"); }
-        "CLOSE" => {
-            let count = state.lock().unwrap().position_count;
-            state.lock().unwrap().reset();
-            info!(final_count = count, "📉 收盘 — 状态清理");
+
+    let mut s = state.lock().unwrap();
+    let duplicated_session = status.session_id.is_some()
+        && status.session_id == s.active_session_id
+        && matches!(
+            (&status.event, s.market_open),
+            (MarketEvent::Open, true) | (MarketEvent::Close, false)
+        );
+    if duplicated_session {
+        info!(session_id = ?status.session_id, event = ?status.event, "忽略重复市场状态事件");
+        return;
+    }
+
+    match status.event {
+        MarketEvent::Open => {
+            s.reset();
+            s.active_session_id = status.session_id.clone();
+            s.market_open = true;
+            info!(session_id = ?status.session_id, "📈 开盘 — 状态重置");
         }
-        other => info!(event = %other, "市场状态"),
+        MarketEvent::Close => {
+            let count = s.position_count;
+            s.reset();
+            s.active_session_id = status.session_id.clone();
+            s.market_open = false;
+            info!(session_id = ?status.session_id, final_count = count, "📉 收盘 — 状态清理");
+        }
+        other => info!(session_id = ?status.session_id, event = ?other, "市场状态"),
     }
 }
 
