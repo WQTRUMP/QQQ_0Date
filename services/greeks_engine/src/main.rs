@@ -10,12 +10,12 @@
 //!   - QQQ 价格变化时 → 全链重算 Greeks → 发布
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Utc, NaiveTime, Timelike};
 use clap::Parser;
 use futures_util::StreamExt;
 use qqq_common::{
     greeks::{self, GreeksRow, GreeksSnapshot},
-    json_bytes, session_clock, subjects, Instrument, OptionRight, RawOptionQuote,
+    json_bytes, subjects, Instrument, OptionRight, RawOptionQuote,
 };
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -32,6 +32,10 @@ struct Args {
     #[arg(long, env = "QUOTE_SUBJECT_PREFIX", default_value = "quote.option")]
     quote_subject_prefix: String,
 
+    /// 距到期剩余小时数（用于 T 计算）
+    #[arg(long, env = "HOURS_TO_EXPIRY", default_value = "6.5")]
+    hours_to_expiry: f64,
+
     /// 无风险利率
     #[arg(long, env = "RISK_FREE_RATE", default_value = "0.05")]
     risk_free_rate: Decimal,
@@ -40,6 +44,9 @@ struct Args {
     #[arg(long, env = "PRICE_CHANGE_THRESHOLD", default_value = "0.01")]
     price_change_threshold: Decimal,
 
+    /// 期权收盘时间 UTC（格式 HH:MM），用于 T 计算
+    #[arg(long, env = "MARKET_CLOSE_UTC", default_value = "20:00")]
+    market_close_utc: String,
 }
 
 #[tokio::main]
@@ -62,13 +69,22 @@ async fn main() -> Result<()> {
 
     info!(
         subject = %subject,
-        "Greeks 引擎 v2 已启动（按美东会话时钟计算 T）"
+        hours_to_expiry = args.hours_to_expiry,
+        market_close_utc = %args.market_close_utc,
+        "Greeks 引擎 v2 已启动（T 动态计算）"
     );
 
     // 状态缓存
     let mut underlying_price = Decimal::ZERO;
     let mut last_published_price = Decimal::ZERO;
     let mut option_quotes: HashMap<String, RawOptionQuote> = HashMap::new();
+
+    // 解析收盘时间
+    let close_parts: Vec<&str> = args.market_close_utc.split(':').collect();
+    let close_hour: u32 = close_parts.first().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let close_min: u32 = close_parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let close_time = NaiveTime::from_hms_opt(close_hour, close_min, 0)
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(20, 0, 0).unwrap());
 
     // 每 5 秒触发一次被动重算，确保 Greeks 在 QQQ 平稳时也不陈旧
     let mut ticker = interval(Duration::from_secs(5));
@@ -84,7 +100,7 @@ async fn main() -> Result<()> {
                 if option_quotes.is_empty() || underlying_price <= Decimal::ZERO {
                     continue;
                 }
-                let t = compute_t_from_now();
+                let t = compute_t_from_now(close_time);
                 let snapshot = build_greeks_snapshot(
                     underlying_price,
                     &option_quotes,
@@ -127,6 +143,7 @@ async fn main() -> Result<()> {
                     &mut last_published_price,
                     &mut option_quotes,
                     &message.subject,
+                    close_time,
                 ).await {
                     Ok(_) => {}
                     Err(err) => {
@@ -148,6 +165,7 @@ async fn handle_quote(
     last_published_price: &mut Decimal,
     option_quotes: &mut HashMap<String, RawOptionQuote>,
     nats_subject: &str,
+    close_time: chrono::NaiveTime,
 ) -> Result<()> {
     let quote: RawOptionQuote =
         serde_json::from_slice(payload).context("解析 RawOptionQuote 失败")?;
@@ -171,7 +189,7 @@ async fn handle_quote(
         }
 
         // 动态计算 T：距收盘的剩余年数
-        let t = compute_t_from_now();
+        let t = compute_t_from_now(close_time);
 
         // 全链重算 Greeks
         let snapshot = build_greeks_snapshot(
@@ -245,9 +263,15 @@ async fn publish_snapshot(
     Ok(())
 }
 
-/// 动态计算距美股当日收盘的剩余时间 → T（年）
-fn compute_t_from_now() -> Decimal {
-    session_clock::years_until_close(Utc::now())
+/// 动态计算距收盘的剩余时间 → T（年）
+/// `close` 为 UTC 收盘时间（如 20:00 = EDT/EST 16:00）
+fn compute_t_from_now(close: NaiveTime) -> Decimal {
+    let now = Utc::now().naive_utc();
+    let now_secs = now.num_seconds_from_midnight() as i64;
+    let close_secs = close.num_seconds_from_midnight() as i64;
+    let remaining_secs = (close_secs - now_secs).max(60); // 至少 1 分钟
+    let hours = remaining_secs as f64 / 3600.0;
+    Decimal::from_str_exact(&format!("{:.8}", hours / (365.25 * 24.0))).unwrap_or(Decimal::ZERO)
 }
 
 fn build_greeks_snapshot(

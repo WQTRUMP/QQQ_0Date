@@ -1,5 +1,4 @@
-use chrono::{DateTime, Datelike, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
-use chrono_tz::America::New_York;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -208,22 +207,11 @@ pub struct OrderAck {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FillEvent {
     pub order_id: String,
-    pub source_signal_id: String,
     pub instrument: Instrument,
     pub side: OrderSide,
     pub quantity: Decimal,
     pub price: Decimal,
     pub filled_at: DateTime<Utc>,
-    #[serde(default)]
-    pub is_exit: bool,
-    #[serde(default = "default_total_legs")]
-    pub total_legs: u32,
-    #[serde(default)]
-    pub leg: u32,
-}
-
-fn default_total_legs() -> u32 {
-    1
 }
 
 // ── Longbridge 原始行情（Python Gateway → NATS）───────
@@ -294,8 +282,6 @@ pub struct MarketStatus {
     pub instrument: Instrument,
     pub event: MarketEvent,
     pub event_time: DateTime<Utc>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
 }
 
 // ── 盘前初始化 ────────────────────────────────────────
@@ -323,27 +309,6 @@ pub struct PremarketInit {
 
 pub mod subjects {
     use super::{AssetClass, Instrument};
-
-    fn option_underlying_key(instrument: &Instrument) -> String {
-        if let Some(base) = &instrument.base {
-            return base
-                .chars()
-                .filter(|value| value.is_ascii_alphanumeric())
-                .collect::<String>()
-                .to_ascii_lowercase();
-        }
-
-        let prefix = instrument
-            .symbol
-            .chars()
-            .take_while(|value| value.is_ascii_alphabetic())
-            .collect::<String>();
-        if prefix.is_empty() {
-            instrument.subject_key()
-        } else {
-            prefix.to_ascii_lowercase()
-        }
-    }
 
     pub fn asset_key(asset_class: &AssetClass) -> &'static str {
         match asset_class {
@@ -395,19 +360,19 @@ pub mod subjects {
     }
 
     pub fn order_ack(instrument: &Instrument) -> String {
-        let subject_key = match instrument.asset_class {
-            AssetClass::Option => option_underlying_key(instrument),
-            _ => instrument.subject_key(),
-        };
-        format!("order.ack.{}.{}", asset_key(&instrument.asset_class), subject_key)
+        format!(
+            "order.ack.{}.{}",
+            asset_key(&instrument.asset_class),
+            instrument.subject_key()
+        )
     }
 
     pub fn fill(instrument: &Instrument) -> String {
-        let subject_key = match instrument.asset_class {
-            AssetClass::Option => option_underlying_key(instrument),
-            _ => instrument.subject_key(),
-        };
-        format!("fill.{}.{}", asset_key(&instrument.asset_class), subject_key)
+        format!(
+            "fill.{}.{}",
+            asset_key(&instrument.asset_class),
+            instrument.subject_key()
+        )
     }
 
     /// Greeks 快照 subject: greeks.option.qqq 等
@@ -440,115 +405,4 @@ pub mod subjects {
 
 pub fn json_bytes<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(value)
-}
-
-pub mod session_clock {
-    use super::*;
-
-    const MARKET_OPEN_HOUR: u32 = 9;
-    const MARKET_OPEN_MINUTE: u32 = 30;
-    const MARKET_CLOSE_HOUR: u32 = 16;
-    const MARKET_CLOSE_MINUTE: u32 = 0;
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum SessionPhase {
-        Open,
-        Closed,
-    }
-
-    #[derive(Clone, Debug)]
-    pub struct SessionSnapshot {
-        pub phase: SessionPhase,
-        pub session_id: String,
-        pub opens_at: DateTime<Utc>,
-        pub closes_at: DateTime<Utc>,
-    }
-
-    pub fn current_session(now: DateTime<Utc>) -> SessionSnapshot {
-        let ny_now = now.with_timezone(&New_York);
-        let session_date = ny_now.date_naive();
-        let opens_local = New_York
-            .from_local_datetime(
-                &session_date
-                    .and_time(NaiveTime::from_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0).unwrap()),
-            )
-            .single()
-            .expect("NYSE open should map to a single wall-clock instant");
-        let closes_local = New_York
-            .from_local_datetime(
-                &session_date
-                    .and_time(NaiveTime::from_hms_opt(MARKET_CLOSE_HOUR, MARKET_CLOSE_MINUTE, 0).unwrap()),
-            )
-            .single()
-            .expect("NYSE close should map to a single wall-clock instant");
-        let phase = if is_trading_day(session_date) && ny_now >= opens_local && ny_now < closes_local {
-            SessionPhase::Open
-        } else {
-            SessionPhase::Closed
-        };
-
-        SessionSnapshot {
-            phase,
-            session_id: session_date.format("%Y-%m-%d").to_string(),
-            opens_at: opens_local.with_timezone(&Utc),
-            closes_at: closes_local.with_timezone(&Utc),
-        }
-    }
-
-    pub fn minutes_until_close(now: DateTime<Utc>) -> Option<i64> {
-        let snapshot = current_session(now);
-        if snapshot.phase != SessionPhase::Open {
-            return None;
-        }
-        Some((snapshot.closes_at - now).num_minutes().max(0))
-    }
-
-    pub fn years_until_close(now: DateTime<Utc>) -> Decimal {
-        let snapshot = current_session(now);
-        if snapshot.phase != SessionPhase::Open {
-            return Decimal::ZERO;
-        }
-
-        let remaining_secs = (snapshot.closes_at - now).num_seconds().max(0) as f64;
-        Decimal::from_str_exact(&format!("{:.8}", remaining_secs / (365.25 * 24.0 * 3600.0)))
-            .unwrap_or(Decimal::ZERO)
-    }
-
-    pub fn next_transition_after(now: DateTime<Utc>) -> (DateTime<Utc>, SessionPhase, String) {
-        let snapshot = current_session(now);
-        match snapshot.phase {
-            SessionPhase::Open => (snapshot.closes_at, SessionPhase::Closed, snapshot.session_id),
-            SessionPhase::Closed => {
-                if is_trading_day(now.with_timezone(&New_York).date_naive()) && now < snapshot.opens_at {
-                    return (snapshot.opens_at, SessionPhase::Open, snapshot.session_id);
-                }
-                let next_date = next_trading_day(now.with_timezone(&New_York).date_naive());
-                let opens_local = New_York
-                    .from_local_datetime(
-                        &next_date
-                            .and_time(NaiveTime::from_hms_opt(MARKET_OPEN_HOUR, MARKET_OPEN_MINUTE, 0).unwrap()),
-                    )
-                    .single()
-                    .expect("NYSE open should map to a single wall-clock instant");
-                (
-                    opens_local.with_timezone(&Utc),
-                    SessionPhase::Open,
-                    next_date.format("%Y-%m-%d").to_string(),
-                )
-            }
-        }
-    }
-
-    fn is_trading_day(date: NaiveDate) -> bool {
-        !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
-    }
-
-    fn next_trading_day(mut date: NaiveDate) -> NaiveDate {
-        loop {
-            date = date.succ_opt().expect("valid trading date");
-            if is_trading_day(date) {
-                return date;
-            }
-        }
-    }
 }

@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Optional
 
 import nats
-from python.common.bootstrap import connect_nats_with_retry
 
 # ── 配置 ──────────────────────────────────────────────
 
@@ -324,7 +323,7 @@ async def main():
     print(f"[logger] SQLite: {DB_PATH}")
     print(f"[logger] 连接 NATS: {NATS_URL}")
 
-    nc = await connect_nats_with_retry(NATS_URL, "trade_logger")
+    nc = await nats.connect(NATS_URL)
 
     async def handler(msg):
         insert_event(db, msg.subject, msg.data)

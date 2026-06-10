@@ -3,12 +3,11 @@ use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures_util::StreamExt;
 use qqq_common::{
-    json_bytes, session_clock, subjects, AssetClass, FillEvent, Instrument, MarketEvent,
-    MarketStatus, OrderIntent, OrderSide, OrderType, RiskDecision, RiskReport, SignalAction,
-    StrategySignal, Venue,
+    json_bytes, subjects, AssetClass, Instrument, OrderIntent, OrderSide, OrderType,
+    RiskDecision, RiskReport, SignalAction, StrategySignal, Venue,
 };
 use redis::AsyncCommands;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -74,6 +73,9 @@ struct Args {
     #[arg(long, env = "TIME_STOP_MIN", default_value = "15")]
     time_stop_min: u32,
 
+    #[arg(long, env = "MARKET_CLOSE_UTC", default_value = "20:00")]
+    market_close_utc: String,
+
     // ── VIX 风控 ──
     /// VIX 数据源 subject（Market Regime 发布 regime.option.qqq，含 vix 字段）
     #[arg(long, env = "VIX_STATE_SUBJECT", default_value = "regime.option.qqq")]
@@ -99,7 +101,6 @@ struct Args {
 struct TrackedPosition {
     order_id: String,
     symbol: String,
-    strike: Option<Decimal>,
     side: OrderSide,
     entry_price: Decimal,
     quantity: Decimal,
@@ -121,20 +122,10 @@ struct TrackedPosition {
 }
 
 impl TrackedPosition {
-    fn new(
-        order_id: String,
-        symbol: String,
-        strike: Option<Decimal>,
-        side: OrderSide,
-        entry_price: Decimal,
-        quantity: Decimal,
-        strategy_id: String,
-        source_signal_id: String,
-    ) -> Self {
+    fn new(order_id: String, symbol: String, side: OrderSide, entry_price: Decimal, quantity: Decimal, strategy_id: String, source_signal_id: String) -> Self {
         Self {
             order_id,
             symbol,
-            strike,
             side,
             entry_price,
             quantity,
@@ -233,13 +224,10 @@ struct RiskState {
     vix_history: VecDeque<Decimal>,
     /// 购买力（USD），来自 Dashboard Bridge 每 15s 推送
     buying_power: Decimal,
-    last_market_session_id: Option<String>,
-    last_market_event: Option<MarketEvent>,
 }
 
 impl RiskState {
     fn new() -> Self {
-        let snapshot = session_clock::current_session(Utc::now());
         Self {
             processed_signals: HashSet::new(),
             counted_fills: HashSet::new(),
@@ -251,11 +239,6 @@ impl RiskState {
             vix_previous: Decimal::ZERO,
             vix_history: VecDeque::new(),
             buying_power: Decimal::MAX,  // 初始默认无限制，等 dashboard 推送后更新
-            last_market_session_id: Some(snapshot.session_id),
-            last_market_event: Some(match snapshot.phase {
-                session_clock::SessionPhase::Open => MarketEvent::Open,
-                session_clock::SessionPhase::Closed => MarketEvent::Close,
-            }),
         }
     }
     fn reset(&mut self) {
@@ -286,8 +269,15 @@ fn dynamic_quantity(confidence: Decimal, min_conf: Decimal, min_qty: Decimal, ma
 
 // ── 时间工具 ──────────────────────────────────────────
 
-fn minutes_to_close() -> Option<i64> {
-    session_clock::minutes_until_close(Utc::now())
+fn minutes_to_close(close_utc: &str) -> Option<i64> {
+    let parts: Vec<&str> = close_utc.split(':').collect();
+    if parts.len() != 2 { return None; }
+    let h: u32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let now = Utc::now();
+    let close = now.date_naive().and_hms_opt(h, m, 0)?;
+    let diff = (close - now.naive_utc()).num_minutes();
+    if diff < 0 { None } else { Some(diff) }
 }
 
 // ── 主入口 ────────────────────────────────────────────
@@ -440,7 +430,7 @@ fn extract_strategy_id(source: &str) -> String {
 }
 
 fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
-    let fill: FillEvent = match serde_json::from_slice(payload) {
+    let fill: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "解析成交失败");
@@ -448,25 +438,31 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
         }
     };
 
-    let order_id = fill.order_id.clone();
+    let order_id = fill.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
     if order_id.is_empty() {
         warn!("成交缺少 order_id");
         return;
     }
 
     let mut s = state.lock().unwrap();
-    if s.counted_fills.contains(&order_id) {
+    if s.counted_fills.contains(order_id) {
         return;
     }
 
     // 从 source_signal_id 提取策略 ID
-    let source_signal_id = fill.source_signal_id.clone();
-    let strategy_id = extract_strategy_id(&source_signal_id);
+    let source_signal_id = fill.get("source_signal_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let strategy_id = extract_strategy_id(source_signal_id);
 
     // ── 检测退出订单 ──
-    if fill.is_exit {
-        s.counted_fills.insert(order_id.clone());
-        let sym = fill.instrument.symbol.clone();
+    let is_exit = fill.get("is_exit").and_then(|v| v.as_bool()).unwrap_or(false);
+    if is_exit {
+        s.counted_fills.insert(order_id.to_string());
+        let sym = fill.get("instrument")
+            .and_then(|i| i.get("symbol"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
 
         // 按 source_signal_id（原始信号 ID）匹配持仓
         let to_remove: Vec<String> = s.positions.iter()
@@ -486,24 +482,29 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
         return;
     }
 
-    let sym = fill.instrument.symbol.clone();
-    let side = fill.side.clone();
-    let side_str = match side {
-        OrderSide::Sell => "SELL",
-        OrderSide::Buy => "BUY",
-    };
-    let entry = fill.price;
-    let qty = fill.quantity;
-    let strike = fill.instrument.strike;
+    let sym = fill.get("instrument")
+        .and_then(|i| i.get("symbol"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let side_str = fill.get("side").and_then(|v| v.as_str()).unwrap_or("BUY");
+    let side = if side_str == "SELL" { OrderSide::Sell } else { OrderSide::Buy };
+    let entry = fill.get("price")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Decimal::from_str_exact(s).ok())
+        .unwrap_or(Decimal::ZERO);
+    let qty = fill.get("quantity")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Decimal::from_str_exact(s).ok())
+        .unwrap_or(Decimal::ONE);
 
     if entry <= Decimal::ZERO || sym.is_empty() {
         warn!(order_id = %order_id, "成交数据不完整");
         return;
     }
 
-    s.counted_fills.insert(order_id.clone());
+    s.counted_fills.insert(order_id.to_string());
     // 检查是否属于价差组合（multi-leg）
-    let total_legs = fill.total_legs;
+    let total_legs = fill.get("total_legs").and_then(|v| v.as_u64()).unwrap_or(1);
     if total_legs >= 2 {
         // 从 order_id 提取 base（去掉 -L0/-L1 后缀）
         let base = match order_id.rsplit_once("-L") {
@@ -512,14 +513,14 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
                 warn!(order_id = %order_id, "⚠️ 价差订单缺少腿编号 -L0/-L1，按单腿处理");
                 // 降级为单腿
                 s.position_count += 1;
-                let pos = TrackedPosition::new(order_id.clone(), sym.clone(), strike, side, entry, qty, strategy_id.clone(), source_signal_id.clone());
-                s.positions.insert(order_id.clone(), pos);
+                let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
+                s.positions.insert(order_id.to_string(), pos);
                 info!(order_id = %order_id, symbol = %sym, strategy = %strategy_id, "📊 持仓已跟踪（降级单腿）");
                 return;
             }
         };
 
-        let pos = TrackedPosition::new(order_id.clone(), sym.clone(), strike, side, entry, qty, strategy_id.clone(), source_signal_id.clone());
+        let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
 
         if let Some(first_leg) = s.pending_spreads.remove(&base) {
             // ── 第二条腿到达 → 配对 ──
@@ -536,9 +537,9 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
 
             // 从 fill instrument 解析 strike 计算宽度
             let sell_strike = fill_for_leg(&fill, &sell_leg)
-                .or_else(|| fill_strike_from_pending(&sell_leg));
+                .or_else(|| fill_strike_from_pending(&base, &s, &sell_leg.order_id));
             let buy_strike = fill_for_leg(&fill, &buy_leg)
-                .or_else(|| fill_strike_from_pending(&buy_leg));
+                .or_else(|| fill_strike_from_pending(&base, &s, &buy_leg.order_id));
 
             let width: Decimal;
             if let (Some(ss), Some(bs)) = (sell_strike, buy_strike) {
@@ -568,82 +569,69 @@ fn handle_fill(state: &Arc<Mutex<RiskState>>, args: &Args, payload: &[u8]) {
         } else {
             // 第一条腿 → 暂存等待配对
             s.pending_spreads.insert(base.clone(), pos);
-            info!(base = %base, leg = fill.leg, "⏳ 等待价差第二条腿");
+            let leg_num = fill.get("leg").and_then(|v| v.as_u64()).unwrap_or(0);
+            info!(base = %base, leg = leg_num, "⏳ 等待价差第二条腿");
         }
     } else {
         // 单腿持仓
         s.position_count += 1;
-        let pos = TrackedPosition::new(order_id.clone(), sym.clone(), strike, side, entry, qty, strategy_id.clone(), source_signal_id.clone());
-        s.positions.insert(order_id.clone(), pos);
+        let pos = TrackedPosition::new(order_id.to_string(), sym.to_string(), side, entry, qty, strategy_id.clone(), source_signal_id.to_string());
+        s.positions.insert(order_id.to_string(), pos);
         info!(order_id = %order_id, symbol = %sym, side = %side_str, entry = %entry, qty = %qty, count = s.position_count, strategy = %strategy_id, "📊 持仓已跟踪");
     }
 
 }
 
 /// 从某条腿的 fill 消息解析 strike
-fn fill_strike(fill: &FillEvent) -> Option<Decimal> {
-    fill.instrument.strike
+fn fill_strike(fill: &serde_json::Value) -> Option<Decimal> {
+    fill.get("instrument")
+        .and_then(|i| i.get("strike"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| Decimal::from_str_exact(s).ok())
+        .or_else(|| {
+            fill.get("instrument")
+                .and_then(|i| i.get("strike"))
+                .and_then(|v| v.as_f64())
+                .and_then(|f| Decimal::from_f64_retain(f))
+        })
 }
 
 /// 按腿的 order_id 匹配 fill：当前 fill 匹配某条腿时用它，否则尝试从 pending 中找
-fn fill_for_leg(fill: &FillEvent, leg: &TrackedPosition) -> Option<Decimal> {
-    if fill.order_id == leg.order_id {
+fn fill_for_leg(fill: &serde_json::Value, leg: &TrackedPosition) -> Option<Decimal> {
+    let fill_oid = fill.get("order_id").and_then(|v| v.as_str()).unwrap_or("");
+    if fill_oid == leg.order_id {
         fill_strike(fill)
     } else {
         None
     }
 }
 
-fn fill_strike_from_pending(leg: &TrackedPosition) -> Option<Decimal> {
-    leg.strike.or_else(|| parse_strike_from_symbol(&leg.symbol))
-}
-
-fn parse_strike_from_symbol(symbol: &str) -> Option<Decimal> {
-    let body = symbol.strip_suffix(".US").unwrap_or(symbol);
-    let strike_digits_rev: String = body
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    if strike_digits_rev.is_empty() {
-        return None;
-    }
-    let strike_digits: String = strike_digits_rev.chars().rev().collect();
-    let raw = strike_digits.parse::<i64>().ok()?;
-    Decimal::from_i64(raw).map(|value| value / Decimal::from(1000))
+/// 从 pending_spreads 中取某条腿的 strike（通过 symbol 反查，精度有限）
+fn fill_strike_from_pending(_base: &str, _s: &std::sync::MutexGuard<'_, RiskState>, _oid: &str) -> Option<Decimal> {
+    // pending_spreads 被 remove 后已不存在，只能通过 symbol 中解析 strike
+    // option symbol 格式: QQQ{YYMMDD}{C/P}{STRIKE*1000}.US
+    // 例如: QQQ260601C450000.US → strike = 450000 / 1000 = 450
+    // 但 leg 的 symbol 已在 TrackedPosition 中，这里尝试从 fill 获取
+    None // 回退到配置 SPREAD_WING_WIDTH
 }
 
 // ── 市场状态 ──────────────────────────────────────────
 
 fn handle_status(state: &Arc<Mutex<RiskState>>, payload: &[u8]) {
-    let status: MarketStatus = match serde_json::from_slice(payload) {
+    let status: serde_json::Value = match serde_json::from_slice(payload) {
         Ok(v) => v,
         Err(e) => { warn!(error = %e, "解析状态失败"); return; }
     };
-    let mut s = state.lock().unwrap();
-    let session_id = status.session_id.clone();
-    let event = status.event.clone();
-    let duplicate_session = session_id.is_some() && s.last_market_session_id == session_id;
-    let duplicate_event = s.last_market_event.as_ref() == Some(&event);
-    if duplicate_session && duplicate_event {
-        info!(event = ?event, session_id = ?session_id, "重复市场状态已忽略");
-        return;
-    }
-
+    let event = status.get("event").and_then(|v| v.as_str()).unwrap_or("");
     match event {
-        MarketEvent::Open => {
-            s.reset();
-            info!(session_id = ?session_id, "📈 开盘 — 状态重置");
+        "OPEN" => { state.lock().unwrap().reset(); info!("📈 开盘 — 状态重置"); }
+        "CLOSE" => {
+            let count = state.lock().unwrap().position_count;
+            state.lock().unwrap().reset();
+            info!(final_count = count, "📉 收盘 — 状态清理");
         }
-        MarketEvent::Close => {
-            let count = s.position_count;
-            s.reset();
-            info!(session_id = ?session_id, final_count = count, "📉 收盘 — 状态清理");
-        }
-        other => info!(event = ?other, session_id = ?session_id, "市场状态"),
+        other => info!(event = %other, "市场状态"),
     }
-    s.last_market_session_id = session_id;
-    s.last_market_event = Some(event);
 }
 
 // ── 信号处理 ──────────────────────────────────────────
@@ -658,13 +646,14 @@ async fn handle_signal(
     let signal: StrategySignal = serde_json::from_slice(payload).context("解析信号失败")?;
     let signal_id = signal.signal_id.clone();
 
-    // ── 去重检查：只有真正发布订单后才固化 ──
+    // ── 去重：内存 + Redis 双重检查 ──
     {
-        let s = state.lock().unwrap();
+        let mut s = state.lock().unwrap();
         if s.processed_signals.contains(&signal_id) {
             warn!(signal_id = %signal_id, "🔁 重复信号（内存）");
             return Ok(());
         }
+        s.processed_signals.insert(signal_id.clone());
     }
 
     // Redis 持久化去重：重启后仍然生效
@@ -674,28 +663,35 @@ async fn handle_signal(
         warn!(signal_id = %signal_id, "🔁 重复信号（Redis）");
         return Ok(());
     }
+    // SETEX key 86400 value (24h TTL)
+    let _: () = redis.set_ex(&redis_key, "1", 86400).await?;
 
     let (current_count, buying_power, vix) = {
         let s = state.lock().unwrap();
         (s.position_count, s.buying_power, s.vix_current)
     };
-    let evaluation = evaluate_signal(&signal, args, current_count, buying_power, vix);
+    let (decision, reason) = evaluate_signal(&signal, args, current_count, buying_power, vix);
 
     nats.publish(
         subjects::risk(&signal.instrument),
         json_bytes(&RiskReport {
             signal_id: signal_id.clone(),
-            decision: evaluation.decision.clone(),
-            reason: evaluation.reason.clone(),
+            decision: decision.clone(),
+            reason: reason.clone(),
             checked_at: Utc::now(),
         })?.into(),
     ).await?;
 
-    if !matches!(evaluation.decision, RiskDecision::Approved) {
-        warn!(signal_id = %signal_id, reason = %evaluation.reason, "信号被拒");
+    if !matches!(decision, RiskDecision::Approved) {
+        warn!(signal_id = %signal_id, reason = %reason, "信号被拒");
         return Ok(());
     }
 
+    let quantity = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
+    if quantity <= Decimal::ZERO {
+        warn!(signal_id = %signal_id, vix = %vix, "VIX过低暂停交易 → 信号被拒");
+        return Ok(());
+    }
     let side = match signal.action {
         SignalAction::Buy => OrderSide::Buy,
         SignalAction::Sell => OrderSide::Sell,
@@ -707,7 +703,7 @@ async fn handle_signal(
         source_signal_id: signal_id.clone(),
         instrument: signal.instrument,
         side,
-        quantity: evaluation.quantity,
+        quantity,
         order_type: OrderType::Market,
         limit_price: None,
         reference_price: signal.reference_price,
@@ -717,41 +713,25 @@ async fn handle_signal(
     };
     let subject = subjects::order_intent(&intent.instrument);
     nats.publish(subject.clone(), json_bytes(&intent)?.into()).await?;
-    {
-        let mut s = state.lock().unwrap();
-        s.processed_signals.insert(signal_id.clone());
-    }
-    let _: () = redis.set_ex(&redis_key, "1", 86400).await?;
 
-    info!(signal_id = %signal_id, conf = %signal.confidence, qty = %evaluation.quantity, "✅ 订单已发布");
+    info!(signal_id = %signal_id, conf = %signal.confidence, qty = %quantity, "✅ 订单已发布");
     Ok(())
 }
 
-struct EvaluationResult {
-    decision: RiskDecision,
-    reason: String,
-    quantity: Decimal,
-}
-
-fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buying_power: Decimal, vix: Decimal) -> EvaluationResult {
+fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buying_power: Decimal, vix: Decimal) -> (RiskDecision, String) {
     if matches!(signal.action, SignalAction::Hold) {
-        return rejected("HOLD");
+        return (RiskDecision::Rejected, "HOLD".into());
     }
     if signal.confidence < args.min_confidence {
-        return rejected(format!("信心{:.2}<{:.2}", signal.confidence, args.min_confidence));
+        return (RiskDecision::Rejected, format!("信心{:.2}<{:.2}", signal.confidence, args.min_confidence));
     }
     if current_count >= args.position_size {
-        return rejected(format!("持仓满({}/{})", current_count, args.position_size));
+        return (RiskDecision::Rejected, format!("持仓满({}/{})", current_count, args.position_size));
     }
 
     // ── 强制信用价差：所有开仓必须带保护腿 ──
     if signal.spread_wing.is_none() && matches!(signal.action, SignalAction::Sell) {
-        return rejected("禁止裸卖: 卖出必须带spread_wing");
-    }
-
-    let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
-    if qty <= Decimal::ZERO {
-        return rejected(format!("VIX门槛未满足({:.1})", vix));
+        return (RiskDecision::Rejected, "禁止裸卖: 卖出必须带spread_wing".into());
     }
 
     // ── 信用价差风险检查 ──
@@ -766,35 +746,25 @@ fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buy
             };
             // 价差宽度 × 100（每张合约乘数）
             let max_loss_per_contract = width * Decimal::from(100);
+            let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
             let total_max_loss = max_loss_per_contract * qty;
             if total_max_loss > args.max_risk_per_trade {
-                return rejected(format!(
+                return (RiskDecision::Rejected, format!(
                     "价差风险${:.0} > 限额${:.0} (宽{}pt × {}张)",
                     total_max_loss, args.max_risk_per_trade, width, qty
                 ));
             }
             // ── 购买力检查：最大亏损不能超过可用购买力 ──
             if buying_power > Decimal::ZERO && buying_power < Decimal::MAX && total_max_loss > buying_power {
-                return rejected(format!(
+                return (RiskDecision::Rejected, format!(
                     "买力不足: 风险${:.0} > 购买力${:.0}", total_max_loss, buying_power
                 ));
             }
         }
     }
 
-    EvaluationResult {
-        decision: RiskDecision::Approved,
-        reason: format!("通过 {}/{} 信{:.2}→{:.0}张 VIX{:.0}", current_count, args.position_size, signal.confidence, qty, vix),
-        quantity: qty,
-    }
-}
-
-fn rejected(reason: impl Into<String>) -> EvaluationResult {
-    EvaluationResult {
-        decision: RiskDecision::Rejected,
-        reason: reason.into(),
-        quantity: Decimal::ZERO,
-    }
+    let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
+    (RiskDecision::Approved, format!("通过 {}/{} 信{:.2}→{:.0}张 VIX{:.0}", current_count, args.position_size, signal.confidence, qty, vix))
 }
 
 // ── 持仓监控（每秒巡检）───────────────────────────────
@@ -814,7 +784,7 @@ async fn check_positions(nats: &async_nats::Client, args: &Args, state: &Arc<Mut
 
         // 时间止损
         if args.time_stop_min > 0 {
-            if let Some(minutes) = minutes_to_close() {
+            if let Some(minutes) = minutes_to_close(&args.market_close_utc) {
                 if minutes <= args.time_stop_min as i64 {
                     let mut visited: HashSet<String> = HashSet::new();
                     for (oid, pos) in s.positions.iter() {

@@ -15,7 +15,6 @@ import time
 from datetime import datetime, timezone
 
 import nats
-from python.common.bootstrap import connect_nats_with_retry
 
 NATS_URL = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
 
@@ -110,7 +109,7 @@ class PositionBook:
 
 
 async def main():
-    nc = await connect_nats_with_retry(NATS_URL, "position_tracker")
+    nc = await nats.connect(NATS_URL)
     book = PositionBook()
     quotes_cache: dict[str, float] = {}
 

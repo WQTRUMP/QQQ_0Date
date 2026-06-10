@@ -21,7 +21,6 @@ from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import nats
-from python.common.bootstrap import connect_nats_with_retry
 
 
 def now_iso() -> str:
@@ -1081,7 +1080,7 @@ class PriceActionStrategy(BaseStrategy):
 async def main() -> None:
     nats_url = os.getenv("NATS_URL", "nats://127.0.0.1:4222")
     strategy_mode = os.getenv("STRATEGY_MODE", "momentum")
-    nc = await connect_nats_with_retry(nats_url, "strategy")
+    nc = await nats.connect(nats_url)
 
     # 订阅体制权重（在策略逻辑之前，确保不丢第一条 regime）
     await subscribe_regime(nc)

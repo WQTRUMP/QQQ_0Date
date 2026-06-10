@@ -4,7 +4,7 @@
 // 不做 Greeks 计算、不做状态管理——那些交给 Rust。
 //
 // NATS subjects:
-//   quote.option.qqqus             → QQQ 正股行情
+//   quote.option.qqq               → QQQ 正股行情
 //   quote.option.vix               → VIX 恐慌指数
 //   kline.option.qqq               → QQQ 1 分钟 K 线
 //   quote.option.{symbol_key}      → 单腿期权行情（含 IV、OI）

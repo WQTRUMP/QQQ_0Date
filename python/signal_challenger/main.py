@@ -23,7 +23,6 @@ import os
 import time
 
 import nats
-from python.common.bootstrap import connect_nats_with_retry
 
 # ── 配置 ──────────────────────────────────────────────
 
@@ -45,7 +44,7 @@ latest_iv: dict[str, float] = {}
 # ── 主逻辑 ────────────────────────────────────────────
 
 async def main():
-    nc = await connect_nats_with_retry(NATS_URL, "challenger")
+    nc = await nats.connect(NATS_URL)
 
     # ── 行情监听（仅更新缓存） ──
     async def on_quote(msg):
