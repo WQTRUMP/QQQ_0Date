@@ -66,8 +66,15 @@ Python 依赖：
 
 ```bash
 python3 -m venv .venv
+. .venv/bin/activate
 .venv/bin/pip install -r requirements.txt
 ```
+
+说明：
+
+- `longbridge` 的 Python SDK 来自官方文档指向的标准 PyPI 包，无需私有索引或额外 `--extra-index-url`。
+- 当前仓库固定为 `longbridge==0.2.77`，这是 PyPI 上可安装的 Python SDK 版本；此前误写的 `4.x` 对应的是其他语言 SDK 的版本线，不适用于 Python `pip` 安装。
+- 已在标准虚拟环境中用 Python 3.11 验证 `pip install -r requirements.txt` 可解析并可导入 `longbridge.openapi`。
 
 Rust 服务：
 
