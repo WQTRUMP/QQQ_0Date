@@ -1,4 +1,5 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveTime, TimeZone, Utc, Weekday};
+use chrono_tz::America::New_York;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -211,6 +212,14 @@ pub struct FillEvent {
     pub side: OrderSide,
     pub quantity: Decimal,
     pub price: Decimal,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source_signal_id: String,
+    #[serde(default)]
+    pub is_exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_legs: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leg: Option<u8>,
     pub filled_at: DateTime<Utc>,
 }
 
@@ -281,6 +290,8 @@ pub enum MarketEvent {
 pub struct MarketStatus {
     pub instrument: Instrument,
     pub event: MarketEvent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub event_time: DateTime<Utc>,
 }
 
@@ -309,6 +320,32 @@ pub struct PremarketInit {
 
 pub mod subjects {
     use super::{AssetClass, Instrument};
+
+    fn option_underlying_key(instrument: &Instrument) -> String {
+        instrument
+            .base
+            .clone()
+            .or_else(|| {
+                let letters: String = instrument
+                    .symbol
+                    .chars()
+                    .take_while(|value| value.is_ascii_alphabetic())
+                    .collect();
+                if letters.is_empty() { None } else { Some(letters) }
+            })
+            .unwrap_or_else(|| instrument.symbol.clone())
+            .chars()
+            .filter(|value| value.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+
+    fn execution_subject_key(instrument: &Instrument) -> String {
+        match instrument.asset_class {
+            AssetClass::Option => option_underlying_key(instrument),
+            _ => instrument.subject_key(),
+        }
+    }
 
     pub fn asset_key(asset_class: &AssetClass) -> &'static str {
         match asset_class {
@@ -363,7 +400,7 @@ pub mod subjects {
         format!(
             "order.ack.{}.{}",
             asset_key(&instrument.asset_class),
-            instrument.subject_key()
+            execution_subject_key(instrument)
         )
     }
 
@@ -371,7 +408,7 @@ pub mod subjects {
         format!(
             "fill.{}.{}",
             asset_key(&instrument.asset_class),
-            instrument.subject_key()
+            execution_subject_key(instrument)
         )
     }
 
@@ -401,8 +438,132 @@ pub mod subjects {
             instrument.subject_key()
         )
     }
+
+    pub fn premkt_init_refresh(instrument: &Instrument) -> String {
+        format!(
+            "init.{}.{}.refresh",
+            asset_key(&instrument.asset_class),
+            instrument.subject_key()
+        )
+    }
 }
 
 pub fn json_bytes<T: Serialize>(value: &T) -> serde_json::Result<Vec<u8>> {
     serde_json::to_vec(value)
+}
+
+pub mod session_clock {
+    use super::*;
+
+    const OPEN_HOUR: u32 = 9;
+    const OPEN_MINUTE: u32 = 30;
+    const CLOSE_HOUR: u32 = 16;
+    const CLOSE_MINUTE: u32 = 0;
+
+    #[derive(Clone, Debug)]
+    pub struct SessionSnapshot {
+        pub state: MarketEvent,
+        pub session_id: String,
+        pub next_transition_at: DateTime<Utc>,
+    }
+
+    fn is_trading_day(date: NaiveDate) -> bool {
+        !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+    }
+
+    fn open_time() -> NaiveTime {
+        NaiveTime::from_hms_opt(OPEN_HOUR, OPEN_MINUTE, 0).expect("valid open time")
+    }
+
+    fn close_time() -> NaiveTime {
+        NaiveTime::from_hms_opt(CLOSE_HOUR, CLOSE_MINUTE, 0).expect("valid close time")
+    }
+
+    fn session_id_for(date: NaiveDate) -> String {
+        date.format("%Y-%m-%d").to_string()
+    }
+
+    fn next_trading_day(mut date: NaiveDate) -> NaiveDate {
+        loop {
+            date += Duration::days(1);
+            if is_trading_day(date) {
+                return date;
+            }
+        }
+    }
+
+    fn local_datetime(date: NaiveDate, time: NaiveTime) -> chrono::DateTime<chrono_tz::Tz> {
+        New_York
+            .from_local_datetime(&date.and_time(time))
+            .single()
+            .expect("market session time should be unambiguous")
+    }
+
+    pub fn current_session(now_utc: DateTime<Utc>) -> SessionSnapshot {
+        let local_now = now_utc.with_timezone(&New_York);
+        let local_date = local_now.date_naive();
+        let local_time = local_now.time();
+        let open = open_time();
+        let close = close_time();
+
+        if is_trading_day(local_date) && local_time >= open && local_time < close {
+            return SessionSnapshot {
+                state: MarketEvent::Open,
+                session_id: session_id_for(local_date),
+                next_transition_at: local_datetime(local_date, close).with_timezone(&Utc),
+            };
+        }
+
+        if is_trading_day(local_date) && local_time < open {
+            return SessionSnapshot {
+                state: MarketEvent::Close,
+                session_id: session_id_for(local_date),
+                next_transition_at: local_datetime(local_date, open).with_timezone(&Utc),
+            };
+        }
+
+        let next_date = if is_trading_day(local_date) && local_time >= close {
+            next_trading_day(local_date)
+        } else if is_trading_day(local_date) {
+            local_date
+        } else {
+            next_trading_day(local_date)
+        };
+
+        SessionSnapshot {
+            state: MarketEvent::Close,
+            session_id: session_id_for(next_date),
+            next_transition_at: local_datetime(next_date, open).with_timezone(&Utc),
+        }
+    }
+
+    pub fn minutes_to_close(now_utc: DateTime<Utc>) -> Option<i64> {
+        let local_now = now_utc.with_timezone(&New_York);
+        let local_date = local_now.date_naive();
+        if !is_trading_day(local_date) {
+            return None;
+        }
+        let local_time = local_now.time();
+        if local_time < open_time() || local_time >= close_time() {
+            return None;
+        }
+        let close_at = local_datetime(local_date, close_time()).with_timezone(&Utc);
+        Some((close_at - now_utc).num_minutes())
+    }
+
+    pub fn remaining_trading_years(now_utc: DateTime<Utc>) -> Decimal {
+        let local_now = now_utc.with_timezone(&New_York);
+        let local_date = local_now.date_naive();
+        if !is_trading_day(local_date) {
+            return Decimal::ZERO;
+        }
+        let local_time = local_now.time();
+        if local_time >= close_time() {
+            return Decimal::ZERO;
+        }
+        let close_at = local_datetime(local_date, close_time()).with_timezone(&Utc);
+        let remaining_secs = (close_at - now_utc).num_seconds().max(0);
+        let years = remaining_secs as f64 / (365.25 * 24.0 * 3600.0);
+        Decimal::from_str_exact(&format!("{years:.8}")).unwrap_or(Decimal::ZERO)
+    }
 }
