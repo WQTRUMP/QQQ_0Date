@@ -1,0 +1,9 @@
+# QQQ_Single Python 服务依赖
+# 安装: pip install -r python/requirements.txt
+
+longbridge>=4.0.0
+nats-py>=2.10.0
+redis>=5.0.0
+websockets>=13.0
+py_vollib>=1.0.1
+python-dotenv>=1.0.0

@@ -1,0 +1,74 @@
+services:
+  nats:
+    image: nats:2.10
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  questdb:
+    image: questdb/questdb:8.2.2
+    ports:
+      - "9000:9000"
+      - "8812:8812"
+      - "9009:9009"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  # ── Python 服务 ──────────────────────────
+
+  longbridge_gateway:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    env_file:
+      - .env.longbridge
+    environment:
+      - NATS_URL=nats://nats:4222
+      - MIN_DAYS_TO_EXPIRY=0
+      - MAX_DAYS_TO_EXPIRY=0
+    depends_on:
+      - nats
+    restart: unless-stopped
+
+  dashboard_bridge:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    env_file:
+      - .env.longbridge
+    environment:
+      - NATS_URL=nats://nats:4222
+      - BRIDGE_PORT=8765
+      - DASHBOARD_HTML=/app/QQQ_0DTE_Dashboard.html
+    ports:
+      - "8765:8765"
+    depends_on:
+      - nats
+    restart: unless-stopped
+    command: python python/dashboard_bridge/main.py
+
+  longbridge_executor:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    env_file:
+      - .env.longbridge
+    environment:
+      - NATS_URL=nats://nats:4222
+      - ORDER_INTENT_SUBJECT=order.intent.option.>
+      - EXECUTION_MODE=paper
+    depends_on:
+      - nats
+    restart: unless-stopped
+

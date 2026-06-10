@@ -1,0 +1,26 @@
+/target/
+/.venv/
+.hermes/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+**/.DS_Store
+.env.longbridge
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# Runtime logs and local trading state
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# Local live-order experiments
+test_*_order.py
+
+# Go
+services/longbridge_gateway/longbridge_gateway
