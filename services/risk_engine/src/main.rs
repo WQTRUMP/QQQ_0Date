@@ -650,23 +650,19 @@ async fn handle_signal(
 
     // ── 去重：内存 + Redis 双重检查 ──
     {
-        let mut s = state.lock().unwrap();
+        let s = state.lock().unwrap();
         if s.processed_signals.contains(&signal_id) {
             warn!(signal_id = %signal_id, "🔁 重复信号（内存）");
             return Ok(());
         }
-        s.processed_signals.insert(signal_id.clone());
     }
 
-    // Redis 持久化去重：重启后仍然生效
     let redis_key = format!("risk:signal:{}", signal_id);
     let already: bool = redis.exists(&redis_key).await.unwrap_or(false);
     if already {
         warn!(signal_id = %signal_id, "🔁 重复信号（Redis）");
         return Ok(());
     }
-    // SETEX key 86400 value (24h TTL)
-    let _: () = redis.set_ex(&redis_key, "1", 86400).await?;
 
     let (current_count, buying_power, vix) = {
         let s = state.lock().unwrap();
@@ -690,10 +686,6 @@ async fn handle_signal(
     }
 
     let quantity = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
-    if quantity <= Decimal::ZERO {
-        warn!(signal_id = %signal_id, vix = %vix, "VIX过低暂停交易 → 信号被拒");
-        return Ok(());
-    }
     let side = match signal.action {
         SignalAction::Buy => OrderSide::Buy,
         SignalAction::Sell => OrderSide::Sell,
@@ -715,6 +707,8 @@ async fn handle_signal(
     };
     let subject = subjects::order_intent(&intent.instrument);
     nats.publish(subject.clone(), json_bytes(&intent)?.into()).await?;
+    let _: () = redis.set_ex(&redis_key, "1", 86400).await?;
+    state.lock().unwrap().processed_signals.insert(signal_id.clone());
 
     info!(signal_id = %signal_id, conf = %signal.confidence, qty = %quantity, "✅ 订单已发布");
     Ok(())
@@ -729,6 +723,10 @@ fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buy
     }
     if current_count >= args.position_size {
         return (RiskDecision::Rejected, format!("持仓满({}/{})", current_count, args.position_size));
+    }
+    let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
+    if qty <= Decimal::ZERO {
+        return (RiskDecision::Rejected, format!("VIX过低暂停交易({vix})"));
     }
 
     // ── 强制信用价差：所有开仓必须带保护腿 ──
@@ -748,7 +746,6 @@ fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buy
             };
             // 价差宽度 × 100（每张合约乘数）
             let max_loss_per_contract = width * Decimal::from(100);
-            let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
             let total_max_loss = max_loss_per_contract * qty;
             if total_max_loss > args.max_risk_per_trade {
                 return (RiskDecision::Rejected, format!(
@@ -765,7 +762,6 @@ fn evaluate_signal(signal: &StrategySignal, args: &Args, current_count: u32, buy
         }
     }
 
-    let qty = dynamic_quantity_with_vix(signal.confidence, args.min_confidence, args.min_order_quantity, args.max_order_quantity, vix);
     (RiskDecision::Approved, format!("通过 {}/{} 信{:.2}→{:.0}张 VIX{:.0}", current_count, args.position_size, signal.confidence, qty, vix))
 }
 
