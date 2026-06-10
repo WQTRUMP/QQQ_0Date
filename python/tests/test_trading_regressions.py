@@ -27,6 +27,33 @@ bootstrap = load_module("bootstrap_module", "common/bootstrap.py")
 
 
 class PositionTrackerTests(unittest.TestCase):
+    def test_exit_fill_with_entry_signal_id_removes_position(self):
+        book = position_tracker.PositionBook()
+        book.upsert(
+            {
+                "order_id": "live-short-signal-1",
+                "side": "SELL",
+                "quantity": "1",
+                "price": "1.25",
+                "source_signal_id": "signal-theta_harvest-1718030000000-abcd1234",
+                "instrument": {"symbol": "QQQ", "strike": "500", "option_right": "PUT"},
+            }
+        )
+
+        book.upsert(
+            {
+                "order_id": "live-cover-signal-1",
+                "side": "BUY",
+                "quantity": "1",
+                "price": "0.55",
+                "source_signal_id": "signal-theta_harvest-1718030000000-abcd1234",
+                "is_exit": True,
+                "instrument": {"symbol": "QQQ", "strike": "500", "option_right": "PUT"},
+            }
+        )
+
+        self.assertEqual(book.positions, {})
+
     def test_buy_exit_removes_short_position(self):
         book = position_tracker.PositionBook()
         book.upsert(

@@ -52,20 +52,30 @@ class PositionBook:
 
         # 平仓优先使用 is_exit/source_signal_id 判定，不依赖 side。
         if is_exit:
-            original_oid = fill.get("origin_order_id") or source_signal_id[5:]
+            original_oid = fill.get("origin_order_id") or ""
+            if not original_oid and source_signal_id.startswith("exit-"):
+                original_oid = source_signal_id[5:]
             if original_oid in self.positions:
                 del self.positions[original_oid]
             else:
-                # 带腿编号后缀的 fallback（如 "exit-live-xxx-L0"）
-                for pid in list(self.positions.keys()):
-                    if pid in original_oid:
+                # 当前 FillEvent 契约在平仓时复用原始 source_signal_id。
+                for pid, pos in list(self.positions.items()):
+                    if source_signal_id and pos.get("source_signal_id") == source_signal_id:
                         del self.positions[pid]
+                        break
+                else:
+                    # 带腿编号后缀的 fallback（如 "exit-live-xxx-L0"）
+                    for pid in list(self.positions.keys()):
+                        if original_oid and pid in original_oid:
+                            del self.positions[pid]
+                            break
         else:
             # 开仓（BUY 开多 / SELL 开空）
             strike = instrument.get("strike", "0")
             option_right = instrument.get("option_right", "")
             self.positions[oid] = {
                 "order_id": oid,
+                "source_signal_id": source_signal_id,
                 "symbol": symbol,
                 "strategy_id": strategy_id,
                 "side": side,
