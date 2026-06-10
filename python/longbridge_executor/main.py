@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 import nats
+from python.common.bootstrap import connect_nats_with_retry
 import redis.asyncio as aioredis
 from longbridge.openapi import (
     Config, TradeContext, OrderType, OrderSide, TimeInForceType,
@@ -289,7 +290,7 @@ async def main():
     print(f"[executor] 模式: {mode}")
     print(f"[executor] 连接 NATS: {NATS_URL}")
 
-    nc = await nats.connect(NATS_URL)
+    nc = await connect_nats_with_retry(NATS_URL, "executor")
 
     # 连接 Redis（持久化去重）
     redis_conn = aioredis.from_url(REDIS_URL)

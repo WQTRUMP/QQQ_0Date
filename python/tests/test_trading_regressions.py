@@ -3,6 +3,7 @@ import sqlite3
 import sys
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -22,6 +23,7 @@ def load_module(name: str, relative_path: str):
 position_tracker = load_module("position_tracker_main", "position_tracker/main.py")
 strategy_engine = load_module("strategy_engine_main", "strategy_engine/main.py")
 trade_logger = load_module("trade_logger_main", "trade_logger/main.py")
+bootstrap = load_module("bootstrap_module", "common/bootstrap.py")
 
 
 class PositionTrackerTests(unittest.TestCase):
@@ -161,6 +163,32 @@ class TradeLoggerTests(unittest.TestCase):
         ).fetchone()
 
         self.assertEqual(row, (0.4, 80.0, 66.67, 10))
+
+
+class BootstrapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_connect_nats_with_retry_retries_before_success(self):
+        attempts = {"count": 0}
+        expected_conn = types.SimpleNamespace(connected_url="nats://127.0.0.1:4222")
+
+        async def flaky_connect(url):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError("not ready")
+            return expected_conn
+
+        nats_stub = types.SimpleNamespace(connect=mock.AsyncMock(side_effect=flaky_connect))
+        with mock.patch.object(bootstrap, "nats", nats_stub):
+            with mock.patch.object(bootstrap.asyncio, "sleep", new=mock.AsyncMock()) as sleep_mock:
+                conn = await bootstrap.connect_nats_with_retry(
+                    "nats://127.0.0.1:4222",
+                    "test_service",
+                    retries=3,
+                    delay_sec=0.01,
+                )
+
+        self.assertIs(conn, expected_conn)
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(sleep_mock.await_count, 2)
 
 
 if __name__ == "__main__":
