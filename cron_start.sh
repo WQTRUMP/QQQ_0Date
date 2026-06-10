@@ -35,6 +35,24 @@ raise SystemExit(f"{name} not ready on {host}:{port}")
 PY
 }
 
+wait_for_http() {
+    local url="$1" name="$2"
+    python3 - "$url" "$name" <<'PY'
+import sys, time, urllib.request
+url, name = sys.argv[1], sys.argv[2]
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if 200 <= resp.status < 300:
+                print(f"{name} ready")
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(1)
+raise SystemExit(f"{name} not ready at {url}")
+PY
+}
+
 # ── 基础设施 ──────────────────────────
 # 确保 NATS 和 Redis 在跑
 pgrep -q nats-server || { echo "启动 NATS..."; brew services start nats-server 2>/dev/null || nats-server -js & }
@@ -69,7 +87,7 @@ sleep 2
 # 2. Dashboard Bridge (Python)
 echo "[cron] 启动 Dashboard Bridge..."
 env NATS_URL="nats://127.0.0.1:4222" python python/dashboard_bridge/main.py > "${LOGDIR}/dashboard_bridge.log" 2>&1 &
-sleep 2
+wait_for_http "http://127.0.0.1:8765/healthz" "Dashboard"
 
 # 2b. Market Regime（体制感知 → 动态策略权重）
 echo "[cron] 启动 Market Regime..."
