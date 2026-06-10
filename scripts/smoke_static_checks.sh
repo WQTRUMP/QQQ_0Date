@@ -43,8 +43,9 @@ python3 - <<'PY'
 from pathlib import Path
 import re
 targets = [
-    Path("services/longbridge_gateway/main.go"),
-    Path("python/market_regime/main.py"),
+    Path("README.md"),
+    Path("docs/INTERFACES.md"),
+    Path("python/longbridge_gateway/main.py"),
 ]
 for path in targets:
     text = path.read_text(encoding="utf-8")
