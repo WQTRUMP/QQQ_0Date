@@ -206,21 +206,17 @@ def _update_summary(db, event_type, data, signal_id, symbol, strategy, side, qty
         # 区分开仓成交 vs 平仓成交
         is_exit = data.get("is_exit", False) or "exit" in signal_id.lower()
         if is_exit:
+            canonical_signal_id = _resolve_summary_signal_id(db, signal_id)
             # 平仓成交 → 更新离场信息
             db.execute(
                 """UPDATE trade_summary SET
                    exit_ts=?, exit_price=?, entry_qty=COALESCE(entry_qty, ?)
-                   WHERE signal_id LIKE ? AND exit_ts IS NULL""",
-                (ts, price, qty, signal_id.replace("exit-", "").rsplit("-", 1)[0] + "%"),
-            )
-            # 尝试精确匹配
-            db.execute(
-                "UPDATE trade_summary SET exit_ts=?, exit_price=? WHERE signal_id=? AND exit_ts IS NULL",
-                (ts, price, signal_id),
+                   WHERE signal_id=? AND exit_ts IS NULL""",
+                (ts, price, qty, canonical_signal_id),
             )
             db.commit()
             # 计算 PnL（如果已有 entry_price）
-            _calc_pnl(db, signal_id)
+            _calc_pnl(db, canonical_signal_id)
         else:
             # 开仓成交 → 更新入场信息
             db.execute(
@@ -235,33 +231,61 @@ def _update_summary(db, event_type, data, signal_id, symbol, strategy, side, qty
         # 检查是否是平仓单
         if "exit" in signal_id.lower():
             reason = data.get("reason") or ""
-            db.execute(
-                "UPDATE trade_summary SET exit_reason=? WHERE signal_id LIKE ? AND exit_reason IS NULL",
-                (reason, signal_id.replace("exit-", "").rsplit("-", 1)[0] + "%"),
-            )
+            canonical_signal_id = _resolve_summary_signal_id(db, signal_id)
             db.execute(
                 "UPDATE trade_summary SET exit_reason=? WHERE signal_id=? AND exit_reason IS NULL",
-                (reason, signal_id),
+                (reason, canonical_signal_id),
             )
             db.commit()
+
+
+def _resolve_summary_signal_id(db, signal_id: str) -> str:
+    """将 exit-* 信号归一到开仓 summary 主键。"""
+    if not signal_id or not signal_id.startswith("exit-"):
+        return signal_id
+
+    base_signal_id = signal_id[5:]
+    candidates = [base_signal_id]
+
+    if "-" in base_signal_id:
+        prefix_candidate = base_signal_id.rsplit("-", 1)[0]
+        if prefix_candidate != base_signal_id:
+            candidates.append(prefix_candidate)
+
+    for candidate in candidates:
+        row = db.execute(
+            "SELECT signal_id FROM trade_summary WHERE signal_id=?",
+            (candidate,),
+        ).fetchone()
+        if row:
+            return row[0]
+
+    prefix = candidates[-1] + "%"
+    row = db.execute(
+        "SELECT signal_id FROM trade_summary WHERE signal_id LIKE ? ORDER BY signal_id LIMIT 1",
+        (prefix,),
+    ).fetchone()
+    if row:
+        return row[0]
+
+    return base_signal_id
 
 
 def _calc_pnl(db, signal_id: str):
     """计算已完成的交易盈亏"""
     cur = db.execute(
-        "SELECT signal_id, entry_price, exit_price, entry_qty FROM trade_summary WHERE signal_id=? AND entry_price IS NOT NULL AND exit_price IS NOT NULL",
+        "SELECT signal_id, signal_action, entry_price, exit_price, entry_qty FROM trade_summary WHERE signal_id=? AND entry_price IS NOT NULL AND exit_price IS NOT NULL",
         (signal_id,),
     )
     # 根据方向计算 PnL（期权合约乘数 ×100）
     row = cur.fetchone()
     if not row:
         return
-    sid, entry, exit_px, qty = row
+    sid, signal_action, entry, exit_px, qty = row
     if not entry or not exit_px or not qty:
         return
-        
-    # 从 signal_id 推导方向：Thetaharvest 信号默认 SELL（信用价差）
-    is_sell = "theta_harvest" in (sid or "").lower()
+
+    is_sell = str(signal_action or "").upper() == "SELL"
     if is_sell:
         pnl = (entry - exit_px) * qty * 100  # 卖开仓 → 跌赚
         pnl_pct = ((entry - exit_px) / entry * 100) if entry != 0 else 0

@@ -17,7 +17,7 @@ import os
 import time
 import uuid
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 import nats
@@ -33,7 +33,7 @@ def decimal_from_dict(d: dict, key: str) -> Decimal:
         return Decimal("0")
     try:
         return Decimal(str(val))
-    except (ValueError, TypeError, decimal.InvalidOperation):
+    except (ValueError, TypeError, InvalidOperation):
         return Decimal("0")
 
 
@@ -279,13 +279,14 @@ class MomentumStrategy(BaseStrategy):
             if delta_val is None:
                 continue
             delta_val = Decimal(str(delta_val))
-            # Delta 在 0.3-0.5 之间
-            if delta_val < Decimal("0.3") or delta_val > Decimal("0.5"):
+            delta_abs = abs(delta_val)
+            # 使用 Delta 绝对值统一筛选，兼容 signed / unsigned put delta。
+            if delta_abs < Decimal("0.3") or delta_abs > Decimal("0.5"):
                 continue
             # 选最接近 ATM 的（行权价离现价最近）
             strike = Decimal(str(row.get("strike", "0")))
             dist = abs(strike - underlying)
-            score = dist + abs(delta_val - Decimal("0.4")) * Decimal("10")  # Delta 0.4 最优
+            score = dist + abs(delta_abs - Decimal("0.4")) * Decimal("10")  # Delta 0.4 最优
             if score < best_score:
                 best_score = score
                 # 构建期权 symbol（格式: QQQ{YYMMDD}{C/P}{STRIKE*1000:06d}.US）

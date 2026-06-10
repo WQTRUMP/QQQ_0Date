@@ -40,6 +40,7 @@ class PositionBook:
         qty = fill.get("quantity", "1")
         price = fill.get("price", "0")
         source_signal_id = fill.get("source_signal_id", "")
+        is_exit = bool(fill.get("is_exit")) or source_signal_id.startswith("exit-")
 
         # 从 source_signal_id 提取 strategy_id
         # 格式: signal-{strategy_id}-{ts}-{random}
@@ -48,37 +49,18 @@ class PositionBook:
         if len(parts) >= 4 and parts[0] == "signal":
             strategy_id = "-".join(parts[1:-2])
 
-        # 判断是开仓还是平仓
-        # SELL side 可能是平仓也可能是开空（ThetaHarvest 用 SELL 开空）
-        if side.upper() == "SELL":
-            # 退场：source_signal_id = "exit-{original_order_id}"
-            if source_signal_id.startswith("exit-"):
-                original_oid = source_signal_id[5:]  # 去掉 "exit-" 前缀
-                if original_oid in self.positions:
-                    del self.positions[original_oid]
-                else:
-                    # 带腿编号后缀的 fallback（如 "exit-live-xxx-L0"）
-                    for pid in list(self.positions.keys()):
-                        if pid in original_oid:
-                            del self.positions[pid]
+        # 平仓优先使用 is_exit/source_signal_id 判定，不依赖 side。
+        if is_exit:
+            original_oid = fill.get("origin_order_id") or source_signal_id[5:]
+            if original_oid in self.positions:
+                del self.positions[original_oid]
             else:
-                # SELL without exit- prefix → 开空仓（ThetaHarvest 等策略）
-                strike = instrument.get("strike", "0")
-                option_right = instrument.get("option_right", "")
-                self.positions[oid] = {
-                    "order_id": oid,
-                    "symbol": symbol,
-                    "strategy_id": strategy_id,
-                    "side": side,
-                    "entry_price": float(price),
-                    "quantity": int(float(qty)),
-                    "strike": strike,
-                    "option_right": option_right,
-                    "entry_time": fill.get("filled_at", now_iso()),
-                    "pnl_pct": 0.0,
-                }
+                # 带腿编号后缀的 fallback（如 "exit-live-xxx-L0"）
+                for pid in list(self.positions.keys()):
+                    if pid in original_oid:
+                        del self.positions[pid]
         else:
-            # 开仓
+            # 开仓（BUY 开多 / SELL 开空）
             strike = instrument.get("strike", "0")
             option_right = instrument.get("option_right", "")
             self.positions[oid] = {
@@ -102,7 +84,11 @@ class PositionBook:
                 current = quotes[sym]
                 entry = pos["entry_price"]
                 if entry > 0:
-                    pos["pnl_pct"] = round((current - entry) / entry * 100, 2)
+                    if str(pos.get("side", "")).upper() == "SELL":
+                        pnl_pct = (entry - current) / entry * 100
+                    else:
+                        pnl_pct = (current - entry) / entry * 100
+                    pos["pnl_pct"] = round(pnl_pct, 2)
 
     def snapshot(self) -> list[dict]:
         """返回当前持仓快照，自动过滤已过期期权"""
