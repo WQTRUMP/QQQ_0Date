@@ -30,6 +30,7 @@ except ImportError:
 import nats
 from websockets.asyncio.server import serve as ws_serve
 from websockets.exceptions import ConnectionClosed
+from python.common.bootstrap import connect_nats_with_retry
 
 # ── 带外静态文件服务（极简：在 WebSocket handshake 之前拦截 GET） ──
 # 我们直接用 websockets 的 process_request 钩子来处理 HTTP GET
@@ -52,10 +53,12 @@ RISK_FREE   = float(os.getenv("RISK_FREE_RATE", "0.05"))  # 5% 无风险利率
 PUSH_MS     = float(os.getenv("BRIDGE_PUSH_MS", "500"))    # 推送间隔（毫秒）
 
 # HTML 看板文件路径
-DASHBOARD_HTML = Path(os.getenv(
-    "DASHBOARD_HTML",
-    os.path.expanduser("~/QQQ_0DTE_Dashboard.html")
-))
+DASHBOARD_HTML = Path(
+    os.getenv(
+        "DASHBOARD_HTML",
+        str(Path(__file__).resolve().parents[2] / "QQQ_0DTE_Dashboard.html"),
+    )
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [bridge] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("dashboard-bridge")
@@ -521,6 +524,19 @@ class DashboardServer:
         # WebSocket 升级请求 → 放行
         if request.headers.get("Upgrade", "").lower() == "websocket":
             return None
+        if request.path == "/healthz":
+            body = json.dumps({
+                "status": "ok",
+                "html_present": DASHBOARD_HTML.exists(),
+                "clients": len(self.clients),
+            }).encode("utf-8")
+            headers = Headers([
+                ("Date", email.utils.formatdate(usegmt=True)),
+                ("Connection", "close"),
+                ("Content-Length", str(len(body))),
+                ("Content-Type", "application/json; charset=utf-8"),
+            ])
+            return Response(200, "OK", headers, body)
         if request.path == "/" or request.path == "/index.html":
             if DASHBOARD_HTML.exists():
                 html = DASHBOARD_HTML.read_text(encoding="utf-8")
@@ -533,7 +549,18 @@ class DashboardServer:
                 ])
                 return Response(200, "OK", headers, body)
             else:
-                return connection.respond(404, "Dashboard HTML not found")
+                body = (
+                    "<!doctype html><html><body><h1>Dashboard HTML missing</h1>"
+                    "<p>Set DASHBOARD_HTML or add QQQ_0DTE_Dashboard.html at repo root.</p>"
+                    "</body></html>"
+                ).encode("utf-8")
+                headers = Headers([
+                    ("Date", email.utils.formatdate(usegmt=True)),
+                    ("Connection", "close"),
+                    ("Content-Length", str(len(body))),
+                    ("Content-Type", "text/html; charset=utf-8"),
+                ])
+                return Response(200, "OK", headers, body)
         # 非 WebSocket 的普通 HTTP 请求 → 404，避免触发升级失败
         return connection.respond(404, "Not Found")
 
@@ -585,8 +612,7 @@ class DashboardServer:
 
 async def nats_loop(state: DashboardState):
     """订阅 NATS 并更新状态"""
-    nc = await nats.connect(NATS_URL)
-    log.info(f"NATS 已连接: {nc.connected_url}")
+    nc = await connect_nats_with_retry(NATS_URL, "dashboard_bridge")
 
     async def on_qqq(msg):
         try:

@@ -1,3 +1,7 @@
+历史架构草图（非当前默认启动链路）
+
+当前主链路请以 README、start.sh 和 services/longbridge_gateway 为准。
+
 Market Data Source
         ↓
 Rust Market Gateway

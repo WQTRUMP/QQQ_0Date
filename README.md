@@ -9,7 +9,7 @@
 ```text
 Longbridge Quote API
   -> Go Market Gateway
-  -> NATS quote.option.*
+  -> NATS quote.option.qqqus / quote.option.*
   -> Rust Realtime Engine / Greeks Engine
   -> Python Market Regime / Strategy Engine / Signal Challenger
   -> Rust Risk Engine
@@ -86,13 +86,13 @@ cd ../..
 
 ## 配置
 
-创建本地凭证文件：
+创建本地配置文件：
 
 ```bash
 cp configs/runtime.env.example .env.longbridge
 ```
 
-然后按 Longbridge OpenAPI 账号填写 `.env.longbridge`。该文件已被 `.gitignore` 忽略，禁止提交到仓库。
+然后按 Longbridge OpenAPI 账号填写 `.env.longbridge`。样例已切换为 QQQ 0DTE 主链路所需字段，包含 dashboard、盘前初始化和启动重试参数。该文件已被 `.gitignore` 忽略，禁止提交到仓库。
 
 常用环境变量：
 
@@ -131,7 +131,16 @@ Dashboard：
 ```text
 http://localhost:8765
 ws://localhost:8765
+http://localhost:8765/healthz
 ```
+
+仓库内已包含默认看板资源 [QQQ_0DTE_Dashboard.html](/workspace/project/QQQ_0DTE_Dashboard.html)。若需替换外置 HTML，可通过 `DASHBOARD_HTML` 指向自定义文件。
+
+## Docker 与历史链路
+
+- `docker compose up longbridge_gateway dashboard_bridge longbridge_executor` 走 Python 兼容入口，适合最小烟雾验证。
+- 本地主启动链路仍以 `./start.sh paper|live` 为准，使用 Go `services/longbridge_gateway` + Python executor。
+- `services/market_gateway`、`services/execution_gateway` 和 [STRUCTURE.md](/workspace/project/STRUCTURE.md) 中的旧 Rust 链路属于历史/备用实现，不再是默认入口。
 
 ## 安全边界
 

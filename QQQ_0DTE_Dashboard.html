@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QQQ 0DTE Dashboard</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      background: radial-gradient(circle at top, #1b263b, #0d1b2a 55%, #000814);
+      color: #e0e1dd;
+    }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    .meta { color: #9fb3c8; margin-bottom: 16px; }
+    pre {
+      background: rgba(13, 27, 42, 0.85);
+      border: 1px solid rgba(159, 179, 200, 0.25);
+      border-radius: 12px;
+      padding: 16px;
+      overflow: auto;
+      min-height: 420px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .status { margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>QQQ 0DTE Dashboard</h1>
+    <div class="meta">Default repo-bundled dashboard resource. Override with <code>DASHBOARD_HTML</code> if needed.</div>
+    <div class="status" id="status">Connecting to ws://localhost:8765 ...</div>
+    <pre id="payload">{}</pre>
+  </main>
+  <script>
+    const status = document.getElementById("status");
+    const payload = document.getElementById("payload");
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${scheme}://${location.host}`);
+    ws.onopen = () => { status.textContent = "WebSocket connected"; };
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        payload.textContent = JSON.stringify(data, null, 2);
+      } catch (err) {
+        payload.textContent = event.data;
+      }
+    };
+    ws.onerror = () => { status.textContent = "WebSocket error"; };
+    ws.onclose = () => { status.textContent = "WebSocket closed"; };
+  </script>
+</body>
+</html>

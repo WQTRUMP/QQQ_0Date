@@ -6,7 +6,7 @@ Market Regime — 市场体制感知 + 动态策略权重
 日内每 30 秒刷新，感知趋势/波动变化即时换挡。
 
 输入 (NATS):
-  quote.option.qqq      → last_done, implied_volatility
+  quote.option.qqqus    → QQQ 正股 last_done
   state.option.qqq      → adx, atr, trend_slope, trend_score
   greeks.option.qqq     → 期权链 (取 Put/Call 比、ATM IV)
   risk.option.qqq       → 风控决策 (连续亏损熔断)
@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import nats
+from python.common.bootstrap import connect_nats_with_retry
 
 
 # ── 配置 ──────────────────────────────────────────────
@@ -278,7 +279,7 @@ async def main():
     global opening_high, opening_low, opening_minutes_elapsed
     global last_30s_ts, consecutive_losses, circuit_breaker_active, circuit_breaker_until
 
-    nc = await nats.connect(NATS_URL)
+    nc = await connect_nats_with_retry(NATS_URL, "market_regime")
     start_time = time.time()
 
     # ── 行情（QQQ 正股 + 期权）──

@@ -111,6 +111,7 @@ VIX.US WebSocket tick
 ```
 ws://localhost:8765
 http://localhost:8765   (HTML 看板)
+http://localhost:8765/healthz   (健康检查)
 ```
 
 ### 推送频率

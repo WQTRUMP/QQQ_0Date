@@ -4,6 +4,41 @@ set -euo pipefail
 cd "$(dirname "$0")"
 EXEC_MODE="${1:-live}"
 
+wait_for_tcp() {
+    local host="$1" port="$2" name="$3"
+    python3 - "$host" "$port" "$name" <<'PY'
+import socket, sys, time
+host, port, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            print(f"{name} ready")
+            raise SystemExit(0)
+    except OSError:
+        time.sleep(1)
+raise SystemExit(f"{name} not ready on {host}:{port}")
+PY
+}
+
+wait_for_http() {
+    local url="$1" name="$2"
+    python3 - "$url" "$name" <<'PY'
+import sys, time, urllib.request
+url, name = sys.argv[1], sys.argv[2]
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        with urllib.request.urlopen(url, timeout=2) as resp:
+            if 200 <= resp.status < 300:
+                print(f"{name} ready")
+                raise SystemExit(0)
+    except Exception:
+        time.sleep(1)
+raise SystemExit(f"{name} not ready at {url}")
+PY
+}
+
 TODAY=$(date +%Y-%m-%d)
 LOGDIR="logs/${TODAY}"
 mkdir -p "$LOGDIR"
@@ -36,7 +71,8 @@ fi
 # 基础设施
 pgrep -q nats-server || { echo "  启动 NATS..."; brew services start nats-server 2>/dev/null || nats-server -js & }
 pgrep -q redis-server || { echo "  启动 Redis..."; brew services start redis 2>/dev/null || redis-server --daemonize yes; }
-sleep 1
+wait_for_tcp 127.0.0.1 4222 "NATS"
+wait_for_tcp 127.0.0.1 6379 "Redis"
 
 PIDS=()
 
@@ -75,7 +111,7 @@ echo ">>> 启动 Dashboard Bridge..."
 env NATS_URL="nats://127.0.0.1:4222" python -u python/dashboard_bridge/main.py > "${LOGDIR}/dashboard_bridge.log" 2>&1 &
 PIDS+=($!)
 echo "  dashboard_bridge PID=$! → http://localhost:8765"
-sleep 2
+wait_for_http "http://127.0.0.1:8765/healthz" "Dashboard"
 
 echo ">>> 启动 Market Regime..."
 python -u python/market_regime/main.py > "${LOGDIR}/market_regime.log" 2>&1 &

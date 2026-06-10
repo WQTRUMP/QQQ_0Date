@@ -15,7 +15,7 @@ struct Args {
     #[arg(
         long,
         env = "ORDER_INTENT_SUBJECT",
-        default_value = "order.intent.crypto.btcusd"
+        default_value = "order.intent.option.>"
     )]
     order_intent_subject: String,
 }
@@ -68,14 +68,6 @@ async fn handle_intent(nats: &async_nats::Client, payload: &[u8]) -> Result<()> 
         reason: "paper execution accepted".to_string(),
         created_at: Utc::now(),
     };
-    let fill = FillEvent {
-        order_id,
-        instrument: intent.instrument.clone(),
-        side: intent.side,
-        quantity: intent.quantity,
-        price: intent.limit_price.unwrap_or(intent.reference_price),
-        filled_at: Utc::now(),
-    };
 
     let ack_subject = subjects::order_ack(&intent.instrument);
     nats.publish(
@@ -85,7 +77,27 @@ async fn handle_intent(nats: &async_nats::Client, payload: &[u8]) -> Result<()> 
     .await
     .with_context(|| format!("发布订单确认失败: {ack_subject}"))?;
 
+    let fill_price = intent.limit_price.unwrap_or(intent.reference_price);
+    let total_legs = if intent.spread_wing.is_some() { 2 } else { 1 };
+    let is_exit = intent.exit_reason.is_some();
     let fill_subject = subjects::fill(&intent.instrument);
+
+    let fill = FillEvent {
+        order_id: if total_legs > 1 {
+            format!("{order_id}-L0")
+        } else {
+            order_id.clone()
+        },
+        source_signal_id: intent.source_signal_id.clone(),
+        instrument: intent.instrument.clone(),
+        side: intent.side.clone(),
+        quantity: intent.quantity,
+        price: fill_price,
+        filled_at: Utc::now(),
+        is_exit,
+        total_legs,
+        leg: 0,
+    };
     nats.publish(
         fill_subject.clone(),
         json_bytes(&fill).context("序列化 FillEvent 失败")?.into(),
@@ -93,6 +105,34 @@ async fn handle_intent(nats: &async_nats::Client, payload: &[u8]) -> Result<()> 
     .await
     .with_context(|| format!("发布成交事件失败: {fill_subject}"))?;
 
+    if let Some(wing) = intent.spread_wing.clone() {
+        let wing_fill = FillEvent {
+            order_id: format!("{order_id}-L1"),
+            source_signal_id: intent.source_signal_id,
+            instrument: wing,
+            side: opposite_side(&intent.side),
+            quantity: intent.quantity,
+            price: fill_price,
+            filled_at: Utc::now(),
+            is_exit,
+            total_legs,
+            leg: 1,
+        };
+        nats.publish(
+            fill_subject.clone(),
+            json_bytes(&wing_fill).context("序列化保护腿 FillEvent 失败")?.into(),
+        )
+        .await
+        .with_context(|| format!("发布保护腿成交事件失败: {fill_subject}"))?;
+    }
+
     info!(intent_id = %intent.intent_id, "paper 订单已确认并模拟成交");
     Ok(())
+}
+
+fn opposite_side(side: &qqq_common::OrderSide) -> qqq_common::OrderSide {
+    match side {
+        qqq_common::OrderSide::Buy => qqq_common::OrderSide::Sell,
+        qqq_common::OrderSide::Sell => qqq_common::OrderSide::Buy,
+    }
 }

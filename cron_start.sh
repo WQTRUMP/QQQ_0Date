@@ -2,7 +2,8 @@
 # ── QQQ_Single Cron 启动（实盘版 · 四策略并行）─────────
 # 由 Hermes cronjob 定时触发，周一至五 21:30 北京时间
 set -euo pipefail
-cd /Users/xncool/Desktop/QQQ_Single
+PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$PROJECT_DIR"
 
 TODAY=$(date +%Y-%m-%d)
 LOGDIR="logs/${TODAY}"
@@ -17,12 +18,29 @@ if [ -f ".env.longbridge" ]; then
     set -a; source .env.longbridge; set +a
 fi
 
+wait_for_tcp() {
+    local host="$1" port="$2" name="$3"
+    python3 - "$host" "$port" "$name" <<'PY'
+import socket, sys, time
+host, port, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+deadline = time.time() + 20
+while time.time() < deadline:
+    try:
+        with socket.create_connection((host, port), timeout=1):
+            print(f"{name} ready")
+            raise SystemExit(0)
+    except OSError:
+        time.sleep(1)
+raise SystemExit(f"{name} not ready on {host}:{port}")
+PY
+}
+
 # ── 基础设施 ──────────────────────────
 # 确保 NATS 和 Redis 在跑
 pgrep -q nats-server || { echo "启动 NATS..."; brew services start nats-server 2>/dev/null || nats-server -js & }
-sleep 1
+wait_for_tcp 127.0.0.1 4222 "NATS"
 pgrep -q redis-server || { echo "启动 Redis..."; brew services start redis 2>/dev/null || redis-server --daemonize yes; }
-sleep 1
+wait_for_tcp 127.0.0.1 6379 "Redis"
 
 # 0. 交易日志收集器（最先启动，确保不丢事件）
 echo "[cron] 启动 Trade Logger..."

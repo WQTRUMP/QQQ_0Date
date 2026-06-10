@@ -40,6 +40,7 @@ services:
     depends_on:
       - nats
     restart: unless-stopped
+    command: ["python", "python/longbridge_gateway/main.py"]
 
   dashboard_bridge:
     build:
@@ -56,7 +57,12 @@ services:
     depends_on:
       - nats
     restart: unless-stopped
-    command: python python/dashboard_bridge/main.py
+    command: ["python", "python/dashboard_bridge/main.py"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
 
   longbridge_executor:
     build:
@@ -71,4 +77,4 @@ services:
     depends_on:
       - nats
     restart: unless-stopped
-
+    command: ["python", "python/longbridge_executor/main.py"]
