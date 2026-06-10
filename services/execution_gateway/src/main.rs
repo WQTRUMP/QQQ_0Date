@@ -108,7 +108,7 @@ async fn handle_intent(nats: &async_nats::Client, payload: &[u8]) -> Result<()> 
     if let Some(wing) = intent.spread_wing.clone() {
         let wing_fill = FillEvent {
             order_id: format!("{order_id}-L1"),
-            source_signal_id: intent.source_signal_id,
+            source_signal_id: intent.source_signal_id.clone(),
             instrument: wing,
             side: opposite_side(&intent.side),
             quantity: intent.quantity,

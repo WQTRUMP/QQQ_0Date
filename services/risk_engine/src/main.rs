@@ -239,6 +239,7 @@ struct RiskState {
 
 impl RiskState {
     fn new() -> Self {
+        let snapshot = session_clock::current_session(Utc::now());
         Self {
             processed_signals: HashSet::new(),
             counted_fills: HashSet::new(),
@@ -250,8 +251,11 @@ impl RiskState {
             vix_previous: Decimal::ZERO,
             vix_history: VecDeque::new(),
             buying_power: Decimal::MAX,  // 初始默认无限制，等 dashboard 推送后更新
-            last_market_session_id: None,
-            last_market_event: None,
+            last_market_session_id: Some(snapshot.session_id),
+            last_market_event: Some(match snapshot.phase {
+                session_clock::SessionPhase::Open => MarketEvent::Open,
+                session_clock::SessionPhase::Closed => MarketEvent::Close,
+            }),
         }
     }
     fn reset(&mut self) {

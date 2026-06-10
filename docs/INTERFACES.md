@@ -92,8 +92,8 @@ VIX.US WebSocket tick
 | 主题 | 发布者 | 订阅者 | 内容 |
 |------|--------|--------|------|
 | `order.intent.option.{key}` | Risk Engine | Executor | `OrderIntent` (含 spread_wing 保护腿) |
-| `order.ack.option.qqq` | Executor | — | `OrderAck` (Accepted/Rejected/Filled) |
-| `fill.option.qqq` | Executor | Risk Engine, Position Tracker | `FillEvent` (成交确认) |
+| `order.ack.option.qqq` | Executor | — | `OrderAck` (按 QQQ 聚合确认) |
+| `fill.option.qqq` | Executor | Risk Engine, Position Tracker | `FillEvent` (成交确认，含 `source_signal_id/is_exit/total_legs/leg`) |
 | `risk.option.{key}` | Risk Engine | Market Regime | `RiskReport` (Approved/Rejected，止损/止盈) |
 
 ### 2.5 状态 & 监控

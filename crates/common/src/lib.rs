@@ -519,6 +519,9 @@ pub mod session_clock {
         match snapshot.phase {
             SessionPhase::Open => (snapshot.closes_at, SessionPhase::Closed, snapshot.session_id),
             SessionPhase::Closed => {
+                if is_trading_day(now.with_timezone(&New_York).date_naive()) && now < snapshot.opens_at {
+                    return (snapshot.opens_at, SessionPhase::Open, snapshot.session_id);
+                }
                 let next_date = next_trading_day(now.with_timezone(&New_York).date_naive());
                 let opens_local = New_York
                     .from_local_datetime(
