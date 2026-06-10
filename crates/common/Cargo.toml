@@ -6,8 +6,8 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+chrono-tz.workspace = true
 rust_decimal = { workspace = true, features = ["maths"] }
 serde.workspace = true
 serde_json.workspace = true
 statrs.workspace = true
-

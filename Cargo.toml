@@ -19,6 +19,7 @@ license = "UNLICENSED"
 anyhow = "1.0"
 async-nats = "=0.38.0"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 clap = { version = "=4.5.20", features = ["derive", "env"] }
 futures-util = "0.3"
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
