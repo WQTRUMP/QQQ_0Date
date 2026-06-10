@@ -49,7 +49,7 @@ crates/common                 Rust 共享消息模型、品种模型和 subject 
 - macOS 或 Linux
 - Rust toolchain，项目带 `rust-toolchain.toml`
 - Go 1.22+
-- Python 3.9+
+- Python 3.9+（仓库当前在 Python 3.11 虚拟环境完成依赖安装验证）
 - Docker / Docker Compose
 - NATS、Redis、QuestDB、Prometheus
 - Longbridge OpenAPI 凭证，仅 live/paper 行情与实盘执行需要
@@ -68,13 +68,17 @@ Python 依赖：
 python3 -m venv .venv
 . .venv/bin/activate
 .venv/bin/pip install -r requirements.txt
+
+# 若只启动 Python 服务，也可直接使用：
+.venv/bin/pip install -r python/requirements.txt
 ```
 
 说明：
 
 - `longbridge` 的 Python SDK 来自官方文档指向的标准 PyPI 包，无需私有索引或额外 `--extra-index-url`。
-- 当前仓库固定为 `longbridge==0.2.77`，这是 PyPI 上可安装的 Python SDK 版本；此前误写的 `4.x` 对应的是其他语言 SDK 的版本线，不适用于 Python `pip` 安装。
-- 已在标准虚拟环境中用 Python 3.11 验证 `pip install -r requirements.txt` 可解析并可导入 `longbridge.openapi`。
+- `python3 -m pip index versions longbridge` 在标准 PyPI 仅返回 `0.2.77` 及以下 `0.2.x` 版本，未提供 `4.x` 版本线。
+- 当前仓库的 `requirements.txt` 与 `python/requirements.txt` 均固定为 `longbridge==0.2.77`；此前误写的 `4.x` 约束应视为错误引用了其他语言 SDK / 非 Python 版本线，不适用于 Python `pip` 安装。
+- 已在标准虚拟环境中用 Python 3.11 验证 `pip install -r requirements.txt`、`pip install -r python/requirements.txt` 均可解析并可导入 `longbridge.openapi`。
 
 Rust 服务：
 
