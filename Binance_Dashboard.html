@@ -1,0 +1,139 @@
+<!--
+[INPUT]: 依赖 /api/snapshot 的 Binance 运行时快照与同源 /assets/dashboard.css、/assets/dashboard.js
+[OUTPUT]: 对外提供 BTCUSDT USDT-M 永续合约行情、风险、仓位与托管保护生命周期的只读运行监控页
+[POS]: 项目根目录的 Binance 操作台外壳，不包含交易写入能力与第三方资源
+[PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'">
+  <title>Binance USDT-M Testnet Console</title>
+  <link rel="stylesheet" href="/assets/dashboard.css">
+  <script src="/assets/dashboard.js" defer></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Binance USDT-M · Testnet Safety Console</div>
+        <h1><span id="symbol">BTCUSDT</span> <span id="contract">PERPETUAL</span></h1>
+        <div class="subtitle">Closed 1m · EMA5/13 entry · ATR14 risk · UTC</div>
+      </div>
+      <div class="status-cluster" aria-label="Runtime status">
+        <span class="pill" id="mode">PAPER</span>
+        <span class="pill" id="connection" data-state="waiting">CONNECTING</span>
+        <span class="pill" id="readiness" data-state="blocked">BLOCKED</span>
+        <span class="pill" id="utc-clock">UTC</span>
+      </div>
+    </header>
+
+    <section class="grid" aria-label="Trading runtime snapshot">
+      <article class="panel wide">
+        <div class="panel-head">
+          <h2>Top of Book</h2>
+          <span class="source">Binance USDT-M · <span id="book-updated">--</span></span>
+        </div>
+        <div class="book">
+          <div class="book-cell">
+            <span class="label">Bid price / size</span>
+            <span class="value bid" id="bid-price">--</span>
+            <span class="source" id="bid-qty">--</span>
+          </div>
+          <div class="book-cell">
+            <span class="label">Spread</span>
+            <span class="value" id="spread">--</span>
+            <span class="source">USDT</span>
+          </div>
+          <div class="book-cell">
+            <span class="label">Ask price / size</span>
+            <span class="value ask" id="ask-price">--</span>
+            <span class="source" id="ask-qty">--</span>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Mark & Funding</h2>
+          <span class="source" id="mark-updated">--</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span class="metric-label">Mark price</span><strong class="metric-value" id="mark-price">--</strong></div>
+          <div class="metric"><span class="metric-label">Index price</span><strong class="metric-value" id="index-price">--</strong></div>
+          <div class="metric"><span class="metric-label">Funding rate</span><strong class="metric-value" id="funding-rate">--</strong></div>
+          <div class="metric"><span class="metric-label">Next funding · UTC</span><strong class="metric-value" id="next-funding">--</strong></div>
+        </div>
+      </article>
+
+      <article class="panel wide">
+        <div class="panel-head">
+          <h2>USDT Account</h2>
+          <span class="source">Paper ledger / Testnet account</span>
+        </div>
+        <div class="metrics">
+          <div class="metric"><span class="metric-label">Wallet balance</span><strong class="metric-value" id="wallet-balance">--</strong></div>
+          <div class="metric"><span class="metric-label">Margin balance</span><strong class="metric-value" id="margin-balance">--</strong></div>
+          <div class="metric"><span class="metric-label">Available balance</span><strong class="metric-value" id="available-balance">--</strong></div>
+          <div class="metric"><span class="metric-label">Unrealized PnL</span><strong class="metric-value" id="unrealized-pnl">--</strong></div>
+        </div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Risk Gate</h2>
+          <span class="source">Fail closed</span>
+        </div>
+        <div class="risk-body">
+          <div class="risk-banner">
+            <div>
+              <div class="risk-state" id="risk-state">BLOCKED</div>
+              <div class="risk-reason" id="risk-reason">Runtime unavailable</div>
+            </div>
+          </div>
+          <div class="risk-values">
+            <div class="risk-value"><span>Can open</span><strong id="can-open">NO</strong></div>
+            <div class="risk-value"><span>Daily drawdown</span><strong id="daily-drawdown">--</strong></div>
+            <div class="risk-value"><span>Hosted protection</span><strong id="protection-state">UNAVAILABLE</strong></div>
+            <div class="risk-value"><span>Exit winner</span><strong id="protection-winner">--</strong></div>
+          </div>
+        </div>
+      </article>
+
+      <article class="panel full">
+        <div class="panel-head">
+          <h2>Positions</h2>
+          <span class="source">BTCUSDT perpetual only</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Symbol</th><th>Side</th><th>Quantity</th><th>Entry</th><th>Mark</th><th>Liquidation</th><th>Leverage</th><th>Unrealized PnL</th></tr>
+            </thead>
+            <tbody id="positions-body"></tbody>
+          </table>
+          <div class="empty" id="positions-empty">No open position</div>
+        </div>
+      </article>
+
+      <article class="panel full">
+        <div class="panel-head">
+          <h2>Runtime Events</h2>
+          <span class="source">Newest first · last 50 shown</span>
+        </div>
+        <div class="events" id="events" aria-live="polite">
+          <div class="empty">Waiting for runtime snapshot</div>
+        </div>
+      </article>
+    </section>
+
+    <footer class="footer">
+      <span>Snapshot: <span id="generated-at">--</span></span>
+      <span>Testnet only · this console cannot submit or cancel orders</span>
+    </footer>
+  </main>
+</body>
+</html>

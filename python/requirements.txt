@@ -1,0 +1,7 @@
+# [INPUT]: 依赖 Binance WebSocket 连接与私有 dotenv 加载能力
+# [OUTPUT]: 对外提供虚拟币交易运行时唯一第三方依赖锁
+# [POS]: python 的精确依赖真源；测试与其余核心逻辑只使用标准库
+# [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+
+websockets==15.0.1
+python-dotenv==1.2.1

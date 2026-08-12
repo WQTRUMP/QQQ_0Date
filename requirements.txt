@@ -1,0 +1,5 @@
+# [INPUT]: 依赖 python/requirements.txt 的精确 Binance 运行依赖锁
+# [OUTPUT]: 对外提供仓库根目录唯一 pip 安装入口
+# [POS]: 项目根级依赖转发器；不复制版本，不引入未被运行闭包消费的包
+# [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+-r python/requirements.txt

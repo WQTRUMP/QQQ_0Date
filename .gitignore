@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# 私有配置；仅样例进入版本库。
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# 本地订单恢复、账本与运行日志。
+logs/
+*.log
+*.db
+*.db-shm
+*.db-wal
